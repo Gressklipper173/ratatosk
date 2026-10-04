@@ -1815,7 +1815,7 @@ function integrationBody(item) {
       btn.addEventListener("click", () => { manualOpen.add(item.container); renderIntegrations(true); });
       add.append(btn);
       if (!manualOpen.has(item.container)) {
-        out.append(el("p", "int-note", `Not set: ${missing.map((k) => k.label).join(", ")}. Each key switches on its own part of ${item.adapter_name}.`));
+        if (!item.auth_keys.some((k) => k.set && k.sufficient)) out.append(el("p", "int-note", `Not set: ${missing.map((k) => k.label).join(", ")}. Each key is optional and switches on its own part of ${item.adapter_name}.`));
         out.append(add);
       }
     }

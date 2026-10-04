@@ -1,9 +1,10 @@
 # Pelican panel: game servers (real names, ports, live state, power actions).
 # Pelican API keys are stored hashed, so an admin enters them by hand. There are two kinds and
 # each is optional:
-#   application  an admin key (read access to servers): the list of all servers, with names and ports
-#   client       a user's API key (Pelican calls it a client key): live state (offline/starting/running/stopping) and power
-#                actions, which go through the panel so Wings stays in step
+#   application  an admin key (read access to servers): lists every server on the panel instead of one account's own
+#   client       a user's API key (Pelican calls it a client key): that account's servers with names and ports, live state
+#                (offline/starting/running/stopping) and power actions, which go through the panel so Wings stays in step.
+#                `sufficient` marks a key that alone gives a working panel, so the page stops saying other keys are not set
 # Docker only knows a game server by its UUID, so this adapter is what gives them names.
 id: pelican
 name: Pelican
@@ -18,6 +19,7 @@ auth:
   kind: keys
   keys:
     - id: application
-      label: Admin API key (names and ports)
+      label: Admin API key (every server on the panel)
     - id: client
-      label: User API key (start/stop and live state)
+      label: User API key (names, ports, state, start/stop)
+      sufficient: true

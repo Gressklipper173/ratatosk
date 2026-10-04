@@ -490,8 +490,8 @@ one is optional and switches on its own part:
 
 | Key | Make it in the panel | Gives you |
 |-----|----------------------|-----------|
-| Admin (application) key | Admin > API keys, with read access to Servers | Every server, with its name and port |
-| User key (Pelican calls it a *client* key) | Your account > API keys, in the Pelican panel | Live state, and start/stop/restart. It only sees servers that account can access |
+| Admin (application) key | Admin > API keys, with read access to Servers | Every server on the panel, not just one account's. Optional if the user key already sees the servers you want |
+| User key (Pelican calls it a *client* key) | Your account > API keys, in the Pelican panel | Names and ports of that account's servers, live state, and start/stop/restart. Enough on its own |
 
 With only the user key, the list is that account's own servers. With only the admin key there
 is no live state, and Start/Stop/Restart still go straight to Docker (the Debug panel notes it

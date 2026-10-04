@@ -96,7 +96,9 @@ def validate_spec(data, trusted=False, handlers=None):
             _need(isinstance(k, dict), f"auth.keys[{i}] must be a mapping")
             kid = _text(k.get("id"), f"auth.keys[{i}].id", 32)
             _need(ID_RE.match(kid), f"auth.keys[{i}].id must be lowercase letters, digits, - or _")
-            out["auth"]["keys"].append({"id": kid, "label": _text(k.get("label"), f"auth.keys[{i}].label", 64)})
+            suff = k.get("sufficient", False)
+            _need(isinstance(suff, bool), f"auth.keys[{i}].sufficient must be true or false")
+            out["auth"]["keys"].append({"id": kid, "label": _text(k.get("label"), f"auth.keys[{i}].label", 64), "sufficient": suff})
         _need(len({k["id"] for k in out["auth"]["keys"]}) == len(keys), "auth.keys ids must be unique")
 
     if "handler" not in out or data.get("test_path") is not None:

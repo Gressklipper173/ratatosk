@@ -480,3 +480,8 @@ def test_the_panel_shows_the_new_state_right_after_a_power_action(env, logged_in
         assert next(r for r in card(c)["panels"][0]["rows"] if r["server"] == U1)["state"] == "stopping"
     finally:
         STATES[U1] = "running"
+
+
+def test_only_the_user_key_is_marked_sufficient(env):
+    keys = {k["id"]: k["sufficient"] for k in env.app.ADAPTERS["pelican"]["auth"]["keys"]}
+    assert keys == {"application": False, "client": True}
