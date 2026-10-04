@@ -1,0 +1,47 @@
+# Version control and local tooling
+.git
+.gitignore
+.claude
+CLAUDE.local.md
+
+# Private notes and docs, not needed in the image
+PLAN.md
+README.md
+LICENSE
+docs/
+
+# Tests and dev dependencies
+tests/
+requirements-dev.txt
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Python and Node leftovers
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+
+# Secrets and local data
+.env
+.env.*
+*.env
+*.pem
+*.key
+data/
+*.log
+
+# Compose files are used by the host, not the image
+docker-compose*.yml
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

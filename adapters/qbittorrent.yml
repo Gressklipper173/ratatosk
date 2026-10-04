@@ -1,0 +1,14 @@
+# qBittorrent: active downloads.
+# qBittorrent logs in with a username and password and keeps a session cookie, so a built-in
+# handler (handlers.py) does the work. There is no key file: the password is stored hashed,
+# so an admin enters the login by hand.
+id: qbittorrent
+name: qBittorrent
+handler: qbittorrent
+
+match:
+  images: [qbittorrent]
+  port: 8080
+
+auth:
+  kind: login

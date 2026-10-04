@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Ratatosk{% endblock %}
+{% block head %}<link rel="icon" id="favicon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%239aa1a8'/%3E%3C/svg%3E">{% endblock %}
+{% block body_attrs %}data-csrf="{{ csrf_token }}" data-role="{{ role }}" data-read-only="{{ 'true' if read_only else 'false' }}"{% endblock %}
+{% block content %}
+<div class="frame" id="frame">
+  <header class="top">
+    <div class="top-l">
+      <h1>Ratatosk</h1>
+      <div class="summary" id="summary" hidden></div>
+    </div>
+    <div class="top-r">
+      {% if read_only %}<span class="badge">read-only</span>{% endif %}
+      <button class="btn" id="debug-btn" type="button" aria-controls="debug" aria-expanded="false">Debug</button>
+      <button class="btn" id="toggle-all" type="button">Collapse all</button>
+      <button class="btn" id="edit-layout" type="button" aria-pressed="false">Customize</button>
+      <button class="btn icon-btn" id="settings-btn" type="button" aria-label="Settings" aria-haspopup="dialog" title="Settings"></button>
+      <a class="logout" href="{{ url_for('logout') }}">Log out ({{ user }})</a>
+    </div>
+  </header>
+
+  <div class="edit-bar" id="edit-bar" hidden>
+    <div class="edit-main">
+      <h2 class="edit-title">Customizing</h2>
+      <p class="edit-hint">Drag a panel by its grip to any column, or drag a container onto a group. Hide a panel with the eye. On a touch screen, press and hold to drag.</p>
+      <button class="btn" id="add-group" type="button">Add group</button>
+    </div>
+    <div class="shelf" id="shelf"></div>
+  </div>
+
+  <section class="debug" id="debug" aria-label="Debug console" hidden>
+    <div class="debug-bar">
+      <h2>Debug</h2>
+      <label>Detail
+        <select id="debug-level" aria-label="Detail level">
+          <option value="normal">Normal</option>
+          <option value="verbose">Verbose (every adapter request)</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="debug-auto" checked> Auto-refresh</label>
+      <label><input type="checkbox" id="debug-warn"> Warnings and errors only</label>
+      <span class="spacer"></span>
+      <button class="btn" id="debug-copy" type="button">Copy</button>
+      <button class="btn" id="debug-close" type="button">Close</button>
+    </div>
+    <pre class="log debug-log" id="debug-log" tabindex="0"></pre>
+    <p class="hint">Kept in memory only, newest 2000 lines, restarts clear it. Keys, passwords and reply bodies are never recorded. Lines can contain container names and addresses.</p>
+  </section>
+
+  <dialog class="cfg" id="settings" aria-labelledby="settings-title">
+    <div class="cfg-head">
+      <h2 id="settings-title">Settings</h2>
+      <button class="mini" id="settings-close" type="button">Close</button>
+    </div>
+    <div class="cfg-body">
+      <p class="hint">These apply to this browser only.</p>
+      <h3 class="cfg-section">Display</h3>
+      <label class="set-field" for="max-columns"><span>Columns<small>Narrow windows still show fewer.</small></span>
+        <select id="max-columns">
+          <option value="1">Up to 1</option>
+          <option value="2">Up to 2</option>
+          <option value="3">Up to 3</option>
+          <option value="4">Up to 4</option>
+          <option value="5">Up to 5</option>
+        </select>
+      </label>
+      <h3 class="cfg-section">Refresh</h3>
+      <label class="set-field" for="list-refresh"><span>Containers<small>The container list, host CPU and memory.</small></span>
+        <select id="list-refresh"></select>
+      </label>
+      <label class="set-field" for="panel-refresh"><span>App panels<small>The panels that show an app's own data.</small></span>
+        <select id="panel-refresh"></select>
+      </label>
+      <h3 class="cfg-section">Integrations</h3>
+      <button class="mini" id="restore-integrations" type="button" hidden>Restore dismissed integrations</button>
+      <p class="hint" id="no-dismissed">Nothing dismissed.</p>
+      <h3 class="cfg-section">Account</h3>
+      <p class="hint">Signed in as {{ user }} ({{ role }}). Your layout and groups belong to this account.</p>
+      <div id="account-box"></div>
+      {% if role == "admin" %}
+      <h3 class="cfg-section">Users</h3>
+      <p class="hint">Admins manage users and app keys. Operators can start, stop and restart containers, update them and arrange their own page.</p>
+      <div id="users-box"></div>
+      {% endif %}
+    </div>
+  </dialog>
+
+  <p class="error" id="error" hidden></p>
+  <div class="notices" id="notices" hidden></div>
+
+  <main class="board" id="board" aria-label="Panels"></main>
+  <div class="new-zone" id="new-zone">Drop a container here to start a new group</div>
+</div>
+<script src="{{ url_for('static', filename='layout.js') }}"></script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+<script src="{{ url_for('static', filename='users.js') }}"></script>
+{% endblock %}

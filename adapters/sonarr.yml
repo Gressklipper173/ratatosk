@@ -1,0 +1,30 @@
+# Sonarr. This is the reference adapter; docs/ADAPTERS.md explains every field.
+id: sonarr
+name: Sonarr
+
+match:
+  images: [sonarr]       # last part of the image name, e.g. lscr.io/linuxserver/sonarr
+  port: 8989             # the port Sonarr listens on inside its container
+
+auth:
+  header: X-Api-Key
+
+# Only read when an admin presses "Find key automatically".
+key_file:
+  path: /config/config.xml
+  regex: '<ApiKey>([^<]+)</ApiKey>'
+
+# Fetched to check a key before it is saved.
+test_path: /api/v3/system/status
+
+panels:
+  - id: missing
+    title: Missing
+    path: /api/v3/wanted/missing
+    params:
+      pageSize: 20
+      includeSeries: true
+    rows: records                       # where the list is in the answer
+    row_title: "{series.title} - {title}"
+    row_detail: "{airDate}"
+    total: totalRecords

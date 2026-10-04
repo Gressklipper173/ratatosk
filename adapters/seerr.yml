@@ -1,0 +1,21 @@
+# Seerr (formerly Jellyseerr/Overseerr): media requests.
+# The request list has no titles, so a built-in handler (handlers.py) looks them up.
+id: seerr
+name: Seerr
+handler: seerr
+
+match:
+  images: [seerr, jellyseerr, overseerr]
+  port: 5055
+
+auth:
+  header: X-Api-Key
+
+# Only read when an admin presses "Find key automatically". settings.json holds several
+# apiKey fields (one per connected app), so the key is picked by its path, not a pattern.
+key_file:
+  path: /app/config/settings.json
+  json_path: main.apiKey
+
+# Needs a valid key, unlike /api/v1/status, which answers anyone.
+test_path: /api/v1/settings/main

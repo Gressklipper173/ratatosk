@@ -1,0 +1,28 @@
+# Radarr: movies. Same shape as sonarr.yml; docs/ADAPTERS.md explains every field.
+id: radarr
+name: Radarr
+
+match:
+  images: [radarr]
+  port: 7878
+
+auth:
+  header: X-Api-Key
+
+# Only read when an admin presses "Find key automatically".
+key_file:
+  path: /config/config.xml
+  regex: '<ApiKey>([^<]+)</ApiKey>'
+
+test_path: /api/v3/system/status
+
+panels:
+  - id: missing
+    title: Missing
+    path: /api/v3/wanted/missing
+    params:
+      pageSize: 20
+    rows: records
+    row_title: "{title}"
+    row_detail: "{year}"
+    total: totalRecords

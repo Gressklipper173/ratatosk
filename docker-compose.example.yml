@@ -1,0 +1,37 @@
+services:
+  ratatosk:
+    build: .
+    container_name: ratatosk
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      # set to true to disable start/stop/restart
+      READ_ONLY: "false"
+      # set to false to stop checking registries for newer images
+      UPDATE_CHECK: "true"
+      # set to true only if a reverse proxy or tunnel is the only way in (see README, Security)
+      BEHIND_PROXY: "false"
+    # Ratatosk is meant to run all the time, so cap Docker's copy of its output.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Optional, for integrations: lets Ratatosk reach an app through the port it
+    # publishes on this host when it isn't on the same Docker network.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ratatosk-data:/data
+      # Grants control of every container on this host (root-equivalent).
+      # Keep Ratatosk off the public internet; see README.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Optional, for the Update button: mount each Compose project's folder at the
+      # same path it has on the host (read-only is fine). Example:
+      # - /home/me/media:/home/me/media:ro
+      # Optional, for your own integration adapters (see docs/ADAPTERS.md):
+      # - ./my-adapters:/data/adapters:ro
+
+volumes:
+  ratatosk-data:

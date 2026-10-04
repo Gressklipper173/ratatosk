@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}First-run setup · Ratatosk{% endblock %}
+{% block content %}
+<main class="auth">
+  <h1>Welcome to Ratatosk</h1>
+  <p class="hint">Create the admin account. The setup token is printed in the container logs (<code>docker logs &lt;container&gt;</code>).</p>
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+  <form method="post">
+    <label>Setup token <input name="token" autocomplete="off" autofocus required></label>
+    <label>Username <input name="username" autocomplete="username" required></label>
+    <label>Password (8+ characters) <input name="password" type="password" autocomplete="new-password" minlength="8" required></label>
+    <button type="submit">Create admin</button>
+  </form>
+</main>
+{% endblock %}

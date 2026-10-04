@@ -1,0 +1,50 @@
+# Private notes, not for the public repo
+PLAN.md
+
+# Local tooling
+.claude/
+CLAUDE.local.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Node (only used for quick frontend checks)
+node_modules/
+
+# Secrets and local data
+.env
+.env.*
+!.env.example
+*.env
+*.pem
+*.key
+data/
+*.log
+
+# Own compose files, the example one stays
+docker-compose.yml
+docker-compose.override.yml
+
+# Editors, OS, leftovers
+.idea/
+.vscode/
+*.swp
+*~
+*.bak
+*.orig
+*.tmp
+.DS_Store
+.directory
+Thumbs.db
