@@ -119,3 +119,10 @@ test("rename, remove and prune touch every width and the hidden list", () => {
   const pruned = L.pruneLayout(layout, (id) => id === "host");
   assert.deepEqual(pruned.columns[1], [["host"]]);
 });
+
+test("the Apps found panel is sized by its row count and gets placed like any other new panel", () => {
+  assert.equal(L.estimatedHeight(P("found", "found", 3)), 9);
+  const layout = { columns: { 2: [["host"], []] }, hidden: [] };
+  const cols = L.columnsFor(layout, 2, [P("host", "host"), P("found", "found", 2)]);
+  assert.deepEqual(cols, [["host"], ["found"]]); // the empty column is shorter
+});

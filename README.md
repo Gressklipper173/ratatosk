@@ -415,8 +415,9 @@ says which file is missing.
 
 ## Integrations
 
-For apps Ratatosk has an adapter for, a **Found** panel appears. Ratatosk
-never reads or stores an app's API key or password on its own. You choose **Find key
+Apps Ratatosk has an adapter for are listed together in one **Apps found** panel, one collapsed row per
+app. Open a row to set that app up; once it is set up it leaves the list and gets a panel of its own.
+Ratatosk never reads or stores an app's API key or password on its own. You choose **Find key
 automatically** (it reads one named file inside the container, after a confirmation),
 **Enter key manually**, or **Dismiss** (undo with **Restore** above the panels, or with **Restore dismissed
 integrations** in **Settings**). The key is checked against the app before it is stored in
@@ -455,11 +456,12 @@ to match an app with a custom image name, or `dashboard.adapter=none` to hide it
    Ratatosk tries every route at once and uses the first that answers. If none does, the
    panel says "could not reach the app".
 2. **Recreate Ratatosk** so the change applies: `docker compose up -d`.
-3. **Open Ratatosk.** A **Found** panel appears for each matching container. The container
-   must be running, because the key is checked against the live app.
+3. **Open Ratatosk.** The **Apps found** panel lists each matching container. Open the row of the one you
+   want. The container must be running, because the key is checked against the live app.
 4. **Add the key.** Press **Find key automatically** (the file it reads is named in the
    confirmation), or **Enter key manually** and paste the key from the app's settings.
-5. **Done.** The panel shows the app's data. **Remove key** (in **Customize**) takes it back to step 3.
+5. **Done.** The app gets a panel with its data and its row leaves **Apps found**. **Remove key** (in
+   **Customize**) puts it back in the list (step 3).
 
 If the app's folder isn't where the adapter expects (for example, an app whose config is not at
 `/config/config.xml`), use **Enter key manually**. An app that signs in with a username and

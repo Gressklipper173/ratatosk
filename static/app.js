@@ -225,6 +225,7 @@ let integrationsLoaded = false;
 function isKnownPanel(id) {
   if (id === "host" || id === "links") return true;
   if (id.startsWith("group:")) return !loaded || allGroupNames().includes(id.slice(6));
+  if (id === "found") return !integrationsLoaded || integrationData.items.some((i) => i.state !== "configured" && i.state !== "dismissed");
   if (id.startsWith("int:")) return !integrationsLoaded || integrationData.items.some((i) => "int:" + i.container === id);
   return false;
 }
@@ -239,6 +240,7 @@ function pinColumns() {
 function panelTitle(id) {
   if (id === "host") return "Host";
   if (id === "links") return "Links";
+  if (id === "found") return "Apps found";
   if (id.startsWith("group:")) return id.slice(6);
   const item = integrationData.items.find((i) => "int:" + i.container === id);
   return item ? item.adapter_name : id;
@@ -1339,13 +1341,18 @@ function render(force, forceInt) {
 
   const groups = groupList();
   const tiles = tileList();
-  const ints = integrationData.items.filter((i) => i.state !== "dismissed");
+  const ints = integrationData.items.filter((i) => i.state === "configured");
+  const waiting = integrationData.items.filter((i) => i.state !== "configured" && i.state !== "dismissed");
   const descs = [{ id: "host", kind: "host", rows: 0 }];
   const data = { host: null, links: { tiles } };
   for (const i of ints) {
     const id = "int:" + i.container;
-    descs.push({ id, kind: "int", rows: i.state === "configured" ? i.panels.reduce((s, x) => s + x.rows.length, 0) : 2 });
+    descs.push({ id, kind: "int", rows: i.panels.reduce((s, x) => s + x.rows.length, 0) });
     data[id] = { item: i };
+  }
+  if (waiting.length) {
+    descs.push({ id: "found", kind: "found", rows: waiting.length });
+    data.found = { items: waiting };
   }
   if (tiles.length || editing) descs.push({ id: "links", kind: "links", rows: tiles.length });
   for (const [name, members] of groups) {
@@ -1362,7 +1369,7 @@ function render(force, forceInt) {
   for (const d of descs) {
     let p = panels.get(d.id);
     if (!p) {
-      p = { host: buildHost, links: buildLinks, int: buildInt, group: buildGroup }[d.kind](d.id);
+      p = { host: buildHost, links: buildLinks, int: buildInt, found: buildFound, group: buildGroup }[d.kind](d.id);
       panels.set(d.id, p);
     }
     if (!hidden.has(d.id)) p.update(data[d.id], force, forceInt);
@@ -1399,7 +1406,7 @@ async function refresh() {
 
 // ---- integrations -------------------------------------------------------
 
-// An app the dashboard has an adapter for shows a "found" panel. Nothing reads or stores
+// An app Ratatosk has an adapter for is listed in the "Apps found" panel. Nothing reads or stores
 // its API key until the admin presses a button here; the key is never sent to the page.
 let integrationData = { items: [], problems: [] };
 // per container: the manual-key form is open / a message to show / a request in flight
@@ -1834,37 +1841,48 @@ function integrationBody(item) {
       out.append(section);
     }
   } else {
-    const login = item.auth_kind === "login";
-    const keys = item.auth_kind === "keys";
-    out.append(el("p", "int-note", keys
-      ? `Found ${item.adapter_name}. It has ${item.auth_keys.length} kinds of API key, each optional and each switching on its own part (${item.auth_keys.map((k) => k.label).join("; ")}). They are stored hashed by the app, so they can't be looked up: enter the ones you want to use. Nothing is stored until you do.`
-      : login
-      ? `Found ${item.adapter_name}. To show its data Ratatosk needs a username and password for it. It can't look them up, because the app stores the password hashed. Nothing is stored until you enter them.`
-      : `Found ${item.adapter_name}. To show its data Ratatosk needs its API key. Nothing is read until you choose.`));
-    const actions = el("div", "int-actions");
-    if (item.key_file && !login) {
-      const find = el("button", "btn primary", "Find key automatically");
-      find.type = "button";
-      find.addEventListener("click", () => findKey(item));
-      actions.append(find);
-    }
-    const manual = el("button", "btn", login ? "Enter login" : keys ? "Enter keys" : "Enter key manually");
-    manual.type = "button";
-    manual.addEventListener("click", () => { manualOpen.add(item.container); renderIntegrations(true); });
-    const dismiss = el("button", "btn", "Dismiss");
-    dismiss.type = "button";
-    dismiss.addEventListener("click", () => integrationCall(item.container, "dismiss", "POST"));
-    actions.append(manual, dismiss);
-    for (const b of actions.querySelectorAll("button")) b.disabled = busy;
-    if (keyLock()) {
-      for (const b of [...actions.querySelectorAll("button")].filter((b) => b.textContent !== "Dismiss")) {
-        b.disabled = true;
-        b.title = keyLock();
-      }
-    }
-    out.append(actions);
-    if (manualOpen.has(item.container)) out.append(manualForm(item));
+    return setupBody(item);
   }
+  const msg = integrationMsg.get(item.container);
+  if (msg) out.append(el("p", "int-note bad", msg));
+  if (busy) out.append(el("p", "int-note", "Working..."));
+  return out;
+}
+
+// The setup steps for an app that was found but is not set up yet: what goes inside its row in "Apps found".
+function setupBody(item) {
+  const busy = integrationBusy.has(item.container);
+  const out = el("div", "int-body");
+  const login = item.auth_kind === "login";
+  const keys = item.auth_kind === "keys";
+  out.append(el("p", "int-note", keys
+    ? `Found ${item.adapter_name}. It has ${item.auth_keys.length} kinds of API key, each optional and each switching on its own part (${item.auth_keys.map((k) => k.label).join("; ")}). They are stored hashed by the app, so they can't be looked up: enter the ones you want to use. Nothing is stored until you do.`
+    : login
+    ? `Found ${item.adapter_name}. To show its data Ratatosk needs a username and password for it. It can't look them up, because the app stores the password hashed. Nothing is stored until you enter them.`
+    : `Found ${item.adapter_name}. To show its data Ratatosk needs its API key. Nothing is read until you choose.`));
+  const actions = el("div", "int-actions");
+  if (item.key_file && !login) {
+    const find = el("button", "btn primary", "Find key automatically");
+    find.type = "button";
+    find.addEventListener("click", () => findKey(item));
+    actions.append(find);
+  }
+  const manual = el("button", "btn", login ? "Enter login" : keys ? "Enter keys" : "Enter key manually");
+  manual.type = "button";
+  manual.addEventListener("click", () => { manualOpen.add(item.container); renderIntegrations(true); });
+  const dismiss = el("button", "btn", "Dismiss");
+  dismiss.type = "button";
+  dismiss.addEventListener("click", () => integrationCall(item.container, "dismiss", "POST"));
+  actions.append(manual, dismiss);
+  for (const b of actions.querySelectorAll("button")) b.disabled = busy;
+  if (keyLock()) {
+    for (const b of [...actions.querySelectorAll("button")].filter((b) => b.textContent !== "Dismiss")) {
+      b.disabled = true;
+      b.title = keyLock();
+    }
+  }
+  out.append(actions);
+  if (manualOpen.has(item.container)) out.append(manualForm(item));
   const msg = integrationMsg.get(item.container);
   if (msg) out.append(el("p", "int-note bad", msg));
   if (busy) out.append(el("p", "int-note", "Working..."));
@@ -1910,6 +1928,48 @@ function buildInt(id) {
       p.edit.replaceChildren();
     }
     p.body.replaceChildren(integrationBody(item));
+  };
+  return p;
+}
+
+// ---- "Apps found": every detected app that is not set up yet, one collapsed row each ------------------------
+
+const foundOpen = new Set(); // containers whose row is expanded
+const foundIsOpen = (name) => foundOpen.has(name) || manualOpen.has(name) || integrationBusy.has(name) || integrationMsg.has(name);
+
+function buildFound(id) {
+  const p = makePanel(id, "int");
+  p.update = ({ items }, force, forceInt) => {
+    const key = JSON.stringify([items, readOnly, role, items.map((i) => [foundIsOpen(i.container), manualOpen.has(i.container), integrationMsg.get(i.container), integrationBusy.has(i.container), integrationName(i.container)])]);
+    if (!force && key === p.key) return;
+    // don't rebuild under someone who is typing a key
+    if (!forceInt && p.el.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
+    p.key = key;
+    p.setHead("Apps found", String(items.length), [led("warn")]);
+    p.edit.replaceChildren();
+    const list = el("ul", "found-list");
+    for (const item of items) {
+      const open = foundIsOpen(item.container);
+      const li = el("li", "found-row" + (open ? " open" : ""));
+      const head = el("button", "found-head");
+      head.type = "button";
+      head.setAttribute("aria-expanded", String(open));
+      head.append(el("span", "found-name", item.adapter_name), el("span", "found-sub", integrationName(item.container)), icon("chevron"));
+      head.addEventListener("click", () => {
+        if (foundIsOpen(item.container)) {
+          foundOpen.delete(item.container);
+          manualOpen.delete(item.container);
+          integrationMsg.delete(item.container);
+        } else {
+          foundOpen.add(item.container);
+        }
+        renderIntegrations(true);
+      });
+      li.append(head);
+      if (open) li.append(setupBody(item));
+      list.append(li);
+    }
+    p.body.replaceChildren(list);
   };
   return p;
 }

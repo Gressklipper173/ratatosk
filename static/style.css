@@ -201,6 +201,16 @@ h1, h2 { margin: 0; }
 .tile.is-hidden { opacity: 0.5; border-style: dashed; }
 
 /* integrations */
+.found-list { list-style: none; margin: 0; padding: 0; }
+.found-row { border-top: 1px solid var(--line); }
+.found-row:first-child { border-top: 0; }
+.found-head { display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px 16px; background: none; border: 0; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.found-head:hover { background: var(--panel-2); }
+.found-name { font-weight: 600; }
+.found-sub { color: var(--muted); font-family: var(--font-mono); font-size: 11.5px; min-width: 0; overflow-wrap: anywhere; }
+.found-head .icon { margin-left: auto; flex: none; transition: transform 0.15s; transform: rotate(-90deg); }
+.found-row.open .found-head .icon { transform: none; }
+@media (prefers-reduced-motion: reduce) { .found-head .icon { transition: none; } }
 .int-body { padding: 0 16px 12px; display: flex; flex-direction: column; gap: 8px; }
 .int-note { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
 .int-note.bad { color: var(--bad); }

@@ -10,8 +10,8 @@ start/stop/restart.
 
 ## How it works for the person using Ratatosk
 
-1. A container matches an adapter (by image name, or by a label). Ratatosk shows a
-   **Found Sonarr** panel. Nothing has been read or stored.
+1. A container matches an adapter (by image name, or by a label). Ratatosk lists it, here
+   Sonarr, as a row in the **Apps found** panel. Nothing has been read or stored.
 2. The admin picks one:
    - **Find key automatically**: Ratatosk reads the one file the adapter names (for
      Sonarr, `/config/config.xml`) inside the container, pulls the key out, checks it against
@@ -19,7 +19,7 @@ start/stop/restart.
    - **Enter key manually**: paste the key into the form. It is checked against the app before
      it is stored.
    - **Dismiss**: hide the panel. **Restore dismissed integrations** in **Settings** (the cog in the page header) brings it back.
-3. With a key stored, the panel shows the app's data. **Remove key** (in **Customize**) goes back to step 1.
+3. With a key stored, the app gets a panel with its data. **Remove key** (in **Customize**) goes back to step 1.
 
 The key is stored in `/data/integrations.json` (readable only by Ratatosk's user). It is
 not encrypted, because Ratatosk would have to keep the encryption key in the same volume.
@@ -47,7 +47,7 @@ request returns the list you want. The app's API documentation or its browser de
    `docker cp myapp.yml <ratatosk>:/data/adapters/`.)
 4. Recreate or restart Ratatosk (`docker compose up -d`, or `docker restart <ratatosk>`).
    Adapters are read at start-up.
-5. A **Found** panel appears for any container whose image matches. Add the key.
+5. The **Apps found** panel lists any container whose image matches. Open its row and add the key.
 
 If a file has a mistake, Ratatosk skips only that file and lists the problem in a red
 "Adapter problems" line above the groups and in the container logs. Other adapters keep working.

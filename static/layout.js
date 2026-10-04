@@ -15,6 +15,7 @@
     if (panel.kind === "host") return 7;
     if (panel.kind === "links") return 3 + Math.ceil(rows / 2) * 2;
     if (panel.kind === "int") return 4 + rows * 2;
+    if (panel.kind === "found") return 3 + rows * 2;
     return 3 + rows * 3; // a group: one row per container
   }
 
