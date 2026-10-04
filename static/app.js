@@ -511,6 +511,77 @@ async function act(name, action, btn) {
   setTimeout(refreshIntegrations, 8000);
 }
 
+// Delete a stopped container: pick what goes with it, then confirm what exactly will happen.
+// The server checks everything again (admin, stopped, not a Wings server, not Ratatosk itself).
+function deleteContainer(c) {
+  if (editing) return;
+  const name = displayName(c);
+  const button = (label, cls, fn) => {
+    const b = el("button", "mini" + (cls ? " " + cls : ""), label);
+    b.type = "button";
+    b.addEventListener("click", () => fn(b));
+    return b;
+  };
+  const dlg = el("dialog", "cfg narrow");
+  const title = el("h2", null, `Delete ${name}`);
+  const body = el("div", "cfg-body");
+  const foot = el("div", "cfg-foot");
+  const close = button("Cancel", "", () => dlg.close());
+  dlg.append(el("div", "cfg-head", undefined), body);
+  dlg.firstChild.append(title);
+  body.append(foot);
+  let volumes = false;
+
+  const choose = () => {
+    body.replaceChildren(foot);
+    const opts = [
+      [false, "Delete the container only", "Like docker compose down. Its anonymous volumes stay on the host as unused storage."],
+      [true, "Delete the container and its anonymous volumes", "Like docker compose down -v, for this one container. Anything kept in its unnamed volumes is lost."],
+    ];
+    const list = opts.map(([value, head, sub]) => {
+      const label = el("label", "del-choice");
+      const radio = el("input");
+      radio.type = "radio";
+      radio.name = "del-scope";
+      radio.checked = volumes === value;
+      radio.addEventListener("change", () => { volumes = value; });
+      label.append(radio, el("span", null, head), el("small", null, sub));
+      return label;
+    });
+    body.prepend(...list, el("p", "hint", "Named volumes and mounted folders are never deleted."));
+    foot.replaceChildren(button("Continue", "primary", confirmStep), close);
+  };
+
+  const confirmStep = () => {
+    body.replaceChildren(foot);
+    body.prepend(el("p", null, volumes
+      ? `This will permanently delete the container ${c.name} and its anonymous volumes. Data stored in those volumes is lost. This can't be undone. Are you sure?`
+      : `This will permanently delete the container ${c.name}. Its anonymous volumes are kept. This can't be undone. Are you sure?`));
+    const yes = button("Yes, delete", "danger", async () => {
+      yes.disabled = true;
+      showError("");
+      try {
+        const res = await api(`/api/containers/${encodeURIComponent(c.name)}`, {
+          method: "DELETE",
+          headers: { "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+          body: JSON.stringify({ volumes }),
+        });
+        if (res.error) showError(`delete ${c.name}: ${res.error}`);
+      } catch (e) {
+        showError(`delete ${c.name}: ${e}`);
+      }
+      dlg.close();
+      refresh();
+    });
+    foot.replaceChildren(yes, button("Back", "", choose), close);
+  };
+
+  dlg.addEventListener("close", () => dlg.remove());
+  document.body.append(dlg);
+  choose();
+  dlg.showModal();
+}
+
 async function updateContainer(c, btn) {
   if (editing) return;
   const ok = confirm(
@@ -769,7 +840,8 @@ function makeItem(name) {
       // only rebuild the buttons when they'd actually differ, so a hover or
       // focus isn't lost to every poll
       const running = wings ? wings !== "offline" : c.status === "running";
-      const key = [running, c.self, readOnly, upd?.state, upd?.blocked].join("|");
+      const canDelete = role === "admin" && !c.game && !c.self && ["exited", "created", "dead"].includes(c.status);
+      const key = [running, c.self, readOnly, upd?.state, upd?.blocked, canDelete].join("|");
       if (key === actionKey) return;
       actionKey = key;
       actionBtns.replaceChildren();
@@ -796,6 +868,13 @@ function makeItem(name) {
         } else {
           b.addEventListener("click", () => act(c.name, a, b));
         }
+        actionBtns.append(b);
+      }
+      if (canDelete) {
+        const b = el("button", "act delete", "Delete");
+        b.type = "button";
+        b.title = "Remove this stopped container";
+        b.addEventListener("click", () => deleteContainer(c));
         actionBtns.append(b);
       }
     },

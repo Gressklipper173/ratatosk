@@ -9,7 +9,7 @@ it needs.
 between the realms.*
 
 - Lists every container with state, health, image, published ports, CPU and memory
-- Start, stop and restart any container
+- Start, stop and restart any container, and delete a stopped one (admins only)
 - Live logs per container (click a row, then **Logs**)
 - Panels: host CPU, memory and storage, link tiles, one panel per app and one per group of
   containers. Arrange them in columns, drag them around and hide the ones you don't
@@ -106,6 +106,10 @@ whether to **Proceed to the dashboard** or **Keep searching**, and shows the err
   of your own, or switch on **Group by Compose project** in Settings). Click a row (or its **⋯**
   button) for **Update** (when a newer image exists), **Logs**, **Restart** and **Stop**.
   Ratatosk's own row says "this instance" and can't be stopped from the page.
+  A stopped container also has **Delete** (admins only). You first choose between deleting the
+  container only (like `docker compose down`) and also its anonymous volumes (like `down -v`,
+  for that one container), then confirm what will happen. Named volumes and mounted folders are
+  never deleted. Pelican game servers (owned by Wings) and Ratatosk itself can't be deleted here.
 - **Browser tab**: a coloured dot and a count show the overall status.
 - **Customize** (page header): drag panels and containers where you want them, rename containers,
   hide panels, add groups. Press **Done** when finished.
@@ -200,7 +204,7 @@ Set these under `environment:` in your compose file.
 
 | Variable    | Default | Meaning                                  |
 |-------------|---------|------------------------------------------|
-| `READ_ONLY` | off     | Disable start/stop/restart/update, app keys and user changes |
+| `READ_ONLY` | off     | Disable start/stop/restart/update/delete, app keys and user changes |
 | `UPDATE_CHECK` | on   | Set `false` to stop asking registries about newer images |
 | `BEHIND_PROXY` | off  | Set `true` when a reverse proxy or tunnel is the only way in: the login throttle and the Debug log then use the visitor's real address |
 | `DATA_DIR`  | `/data` | Where users, keys, layouts and the session key are kept. Leave it and mount a volume there |

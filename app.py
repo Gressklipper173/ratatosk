@@ -1132,6 +1132,38 @@ def container_action(name, action):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/containers/<name>", methods=["DELETE"])
+@admin_required
+def container_delete(name):
+    """Remove one stopped container (`docker rm`). `volumes: true` also removes its anonymous
+    volumes (`docker rm -v`); named volumes and bind mounts are never touched. A game server is
+    Wings' to remove, so it is refused here whatever the page showed."""
+    if READ_ONLY:
+        return jsonify({"error": "Ratatosk is in read-only mode"}), 403
+    if not csrf_ok():
+        return jsonify({"error": "bad csrf token"}), 403
+    body = request.get_json(silent=True)
+    volumes = body.get("volumes") if isinstance(body, dict) else None
+    if not isinstance(volumes, bool):
+        return jsonify({"error": "volumes must be true or false"}), 400
+    try:
+        c = docker_client.containers.get(name)
+        if describe(c)["self"]:
+            return jsonify({"error": "Ratatosk can't delete its own container"}), 400
+        if is_game_server(c.attrs.get("Config", {}).get("Labels") or {}):
+            return jsonify({"error": "This container belongs to Wings. Delete the server in Pelican instead"}), 400
+        if c.status not in ("exited", "created", "dead"):
+            return jsonify({"error": "Only a stopped container can be deleted"}), 409
+        c.remove(v=volumes)
+        activity.log("info", "containers", f"deleted {name}" + (" with its anonymous volumes" if volumes else ""))
+        return jsonify({"error": None})
+    except docker.errors.NotFound:
+        return jsonify({"error": "no such container"}), 404
+    except docker.errors.DockerException as e:
+        activity.log("error", "containers", f"delete {name} failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 # ---- game-server config editor ----------------------------------------------------------------
 #
 # Goes through Pelican's Client API with the stored user key, for Pelican game servers only. The

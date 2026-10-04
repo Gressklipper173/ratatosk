@@ -55,6 +55,9 @@ class FakeContainer:
     def restart(self, timeout=None):
         self.calls.append("restart")
 
+    def remove(self, v=False, force=False):
+        self.calls.append(("remove", v))
+
     def logs(self, tail=None, timestamps=False):
         self.last_tail = tail
         return self._logs

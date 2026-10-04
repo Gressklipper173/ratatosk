@@ -91,6 +91,47 @@ def test_read_only_blocks_actions(env, logged_in, monkeypatch):
     assert web.calls == []
 
 
+# ---- deleting a stopped container ---------------------------------------
+
+
+def _delete(c, csrf, name, volumes):
+    return c.delete(f"/api/containers/{name}", json={"volumes": volumes}, headers={"X-CSRF-Token": csrf})
+
+
+@pytest.mark.parametrize("volumes", [False, True])
+def test_delete_removes_a_stopped_container(env, logged_in, volumes):
+    c, csrf = logged_in
+    web = env.client.add(FakeContainer("web", status="exited"))
+    assert _delete(c, csrf, "web", volumes).status_code == 200
+    assert web.calls == [("remove", volumes)]
+
+
+def test_delete_refuses_running_wings_self_and_bad_requests(env, logged_in):
+    c, csrf = logged_in
+    running = env.client.add(FakeContainer("web"))
+    wings = env.client.add(FakeContainer("a" * 8 + "-1111-2222-3333-" + "b" * 12, status="exited", labels={"ContainerType": "server_process"}))
+    me = env.client.add(FakeContainer("dashboard", status="exited", short_id="dashboardself"))
+    assert _delete(c, csrf, "web", False).status_code == 409
+    assert _delete(c, csrf, wings.name, True).status_code == 400
+    assert _delete(c, csrf, "dashboard", False).status_code == 400
+    assert _delete(c, csrf, "nope", False).status_code == 404
+    assert c.delete("/api/containers/web", json={"volumes": "yes"}, headers={"X-CSRF-Token": csrf}).status_code == 400
+    assert c.delete("/api/containers/web", json={"volumes": False}).status_code == 403
+    assert running.calls == [] and wings.calls == [] and me.calls == []
+
+
+def test_delete_is_admin_only_and_off_in_read_only(env, logged_in, monkeypatch):
+    from test_users import hdr, make_user, sign_in
+
+    c, csrf = logged_in
+    web = env.client.add(FakeContainer("web", status="exited"))
+    o, ocsrf = sign_in(env, "op", make_user(env, c, csrf))
+    assert _delete(o, ocsrf, "web", False).status_code == 403
+    monkeypatch.setattr(env.app, "READ_ONLY", True)
+    assert _delete(c, csrf, "web", False).status_code == 403
+    assert web.calls == []
+
+
 # ---- listing, grouping, stats -------------------------------------------
 
 
