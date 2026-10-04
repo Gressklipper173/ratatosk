@@ -126,3 +126,12 @@ test("the Apps found panel is sized by its row count and gets placed like any ot
   const cols = L.columnsFor(layout, 2, [P("host", "host"), P("found", "found", 2)]);
   assert.deepEqual(cols, [["host"], ["found"]]); // the empty column is shorter
 });
+
+test("a trailing panel does not move the others on a width nobody arranged", () => {
+  const found = P("found", "found", 3);
+  for (let n = 1; n <= 5; n++) {
+    const without = L.columnsFor(empty, n, panels);
+    const withFound = L.columnsFor(empty, n, [...panels, found]).map((c) => c.filter((id) => id !== "found"));
+    assert.deepEqual(withFound, without);
+  }
+});

@@ -1350,15 +1350,16 @@ function render(force, forceInt) {
     descs.push({ id, kind: "int", rows: i.panels.reduce((s, x) => s + x.rows.length, 0) });
     data[id] = { item: i };
   }
-  if (waiting.length) {
-    descs.push({ id: "found", kind: "found", rows: waiting.length });
-    data.found = { items: waiting };
-  }
   if (tiles.length || editing) descs.push({ id: "links", kind: "links", rows: tiles.length });
   for (const [name, members] of groups) {
     const id = "group:" + name;
     descs.push({ id, kind: "group", rows: members.length });
     data[id] = { name, members };
+  }
+  // last, so that a width nobody arranged yet keeps every other panel where it was dealt
+  if (waiting.length) {
+    descs.push({ id: "found", kind: "found", rows: waiting.length });
+    data.found = { items: waiting };
   }
 
   const wanted = new Set(descs.map((d) => d.id));
@@ -1376,6 +1377,12 @@ function render(force, forceInt) {
   }
 
   placePanels(descs);
+  // The first view of a width saves its arrangement, so a later new panel can't reshuffle the rest.
+  if (loaded && integrationsLoaded && !editing && !dragging && !groupSettings.layout.columns[String(columnsN)]) {
+    pinColumns();
+    localEdits++;
+    saveGroups();
+  }
   summarize();
   renderShelf(descs);
   renderNotices();

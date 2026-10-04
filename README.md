@@ -272,7 +272,8 @@ finish). Drag a panel by its grip (or press and hold on a touch screen) to any c
 position, or focus the grip and use the arrow keys. The eye
 hides a panel; hidden panels wait in the **Hidden panels** shelf of the edit bar, where
 **Show** puts them back. Each width keeps its own arrangement, so arranging on your phone
-never changes your desktop. The layout is saved on the server, per user (`/data/groups/`), so
+never changes your desktop. The first time you open a width, its arrangement is saved as it
+appears, so an app or group added later goes to the bottom instead of moving your panels. The layout is saved on the server, per user (`/data/groups/`), so
 each person's devices see the same panels and the same hidden ones. The arrow in a panel's header
 folds it; folded panels (and **Collapse all** / **Expand all** in the page header) are remembered per
 browser. Layout editing stays available in `READ_ONLY` mode, since it changes only how
