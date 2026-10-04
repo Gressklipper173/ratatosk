@@ -21,6 +21,7 @@ const shelfEl = document.getElementById("shelf");
 const editBar = document.getElementById("edit-bar");
 const errorEl = document.getElementById("error");
 const toggleAllBtn = document.getElementById("toggle-all");
+const groupByProject = document.getElementById("group-by-project");
 const restoreBtn = document.getElementById("restore-integrations");
 const editBtn = document.getElementById("edit-layout");
 const addBtn = document.getElementById("add-group");
@@ -34,10 +35,11 @@ let readOnly = false;
 let role = document.body.dataset.role;
 const keyLock = () => (readOnly ? "Ratatosk is read-only" : role !== "admin" ? "Only an admin can change app keys" : "");
 let loaded = false; // the container list has arrived at least once
+let listError = ""; // why the last container list call failed, if it did
 // shared across devices: saved on the server
 let groupSettings = {
   assignments: {}, custom_groups: [], on_demand_groups: [], critical_groups: [], container_priority: {},
-  aliases: {}, group_order: [], hidden_links: [], link_groups: [], link_containers: [], disks: [], layout: { columns: {}, hidden: [] },
+  aliases: {}, group_order: [], hidden_links: [], link_groups: [], link_containers: [], disks: [], group_by_project: false, layout: { columns: {}, hidden: [] },
 };
 let editing = false;
 let dragging = false;
@@ -165,7 +167,10 @@ function setLinkMode(name, mode) {
   if (mode === "show") groupSettings.link_containers.push(name);
 }
 
-function groupOf(c) { return groupSettings.assignments[c.name] || c.project || UNGROUPED; }
+// Where a container sits unless the user placed it: its Compose project's group, or Ungrouped
+// (which is where everything starts unless the account has "Group by Compose project" switched on).
+function defaultGroup(c) { return (groupSettings.group_by_project === true && c.project) || UNGROUPED; }
+function groupOf(c) { return groupSettings.assignments[c.name] || defaultGroup(c); }
 
 // The groups that exist, in the order a first layout deals them out: the user's saved
 // `group_order` (older versions), then any other group alphabetically, Ungrouped last.
@@ -266,7 +271,7 @@ function changed() {
 function moveTo(c, target) {
   if (groupOf(c) === target) return;
   // moving a container back to its own default drops the override
-  if (target === (c.project || UNGROUPED)) delete groupSettings.assignments[c.name];
+  if (target === defaultGroup(c)) delete groupSettings.assignments[c.name];
   else groupSettings.assignments[c.name] = target;
   changed();
 }
@@ -1320,6 +1325,7 @@ function placePanels(descs) {
 // force: rebuild every panel even if its data looks unchanged (after a local edit).
 // forceInt: also rebuild an integration panel someone is typing in.
 function render(force, forceInt) {
+  groupByProject.checked = groupSettings.group_by_project === true;
   // drop rows for containers that no longer exist, and make rows for new ones
   const names = new Set(containers.map((c) => c.name));
   for (const [name, item] of items) {
@@ -1373,7 +1379,8 @@ async function refresh() {
   const editsAtStart = localEdits;
   try {
     const [list, vitals] = await Promise.all([api(`/api/containers?age=${view.listRefresh}`), api("/api/vitals")]);
-    if (list.error) { showError(list.error); setTab("exited", "can't reach Docker"); summaryEl.dataset.key = ""; return; }
+    if (list.error) { listError = list.error; showError(list.error); setTab("exited", "can't reach Docker"); summaryEl.dataset.key = ""; return; }
+    listError = "";
     showError("");
     containers = list.items;
     readOnly = list.read_only;
@@ -1383,6 +1390,7 @@ async function refresh() {
     renderVitals(vitals);
     render(false);
   } catch (e) {
+    listError = String(e);
     showError(String(e));
     setTab("exited", "can't reach Ratatosk");
     summaryEl.dataset.key = "";
@@ -2092,6 +2100,46 @@ panels.set("host", buildHost());
 render(false);
 refresh();
 refreshIntegrations();
+
+// Right after the admin account is made the page opens on a "searching" screen. It goes away as soon as
+// the container list has arrived, with or without other containers (Ratatosk itself is always in it).
+// If the list still hasn't arrived after 15 s it asks whether to carry on, for a host where only the
+// host stats are wanted.
+const welcomeEl = document.getElementById("welcome");
+if (location.search.includes("welcome")) history.replaceState(null, "", location.pathname);
+function startWelcome() {
+  const SEARCH_MS = 15000, STEP_MS = 1500;
+  const title = document.getElementById("welcome-title");
+  const text = document.getElementById("welcome-text");
+  const spinner = document.getElementById("welcome-spinner");
+  const actions = document.getElementById("welcome-actions");
+  const proceed = document.getElementById("welcome-proceed");
+  const finish = () => { welcomeEl.hidden = true; };
+  let run = 0; // a newer search cancels an older one
+  async function search() {
+    const mine = ++run;
+    spinner.hidden = false; actions.hidden = true;
+    title.textContent = "Searching for containers…";
+    text.textContent = "Looking at what is running on this host.";
+    const end = Date.now() + SEARCH_MS;
+    while (Date.now() < end) {
+      await refresh();
+      if (mine !== run) return;
+      if (loaded) { finish(); return; }
+      await new Promise((r) => setTimeout(r, STEP_MS));
+      if (mine !== run) return;
+    }
+    spinner.hidden = true; actions.hidden = false;
+    title.textContent = "Could not find any containers";
+    text.textContent = "Ratatosk could not get the container list from Docker. Proceed to the dashboard?" +
+      (listError ? ` (${listError})` : "");
+    proceed.focus();
+  }
+  proceed.addEventListener("click", () => { run++; finish(); });
+  document.getElementById("welcome-retry").addEventListener("click", search);
+  search();
+}
+if (!welcomeEl.hidden) startWelcome();
 // Timers are re-armed when the setting changes. A tab that was hidden catches up as soon as it is
 // shown again instead of waiting for the next tick (browsers slow timers in background tabs).
 let listTimer = null;
@@ -2104,6 +2152,11 @@ function startPanelPolling() {
   clearInterval(panelTimer);
   panelTimer = setInterval(refreshIntegrations, view.panelRefresh * 1000);
 }
+// Saved with the account (not this browser): kept in the group settings like the layout.
+groupByProject.addEventListener("change", () => {
+  groupSettings.group_by_project = groupByProject.checked;
+  changed();
+});
 const maxColumns = document.getElementById("max-columns");
 maxColumns.value = String(view.maxColumns);
 maxColumns.addEventListener("change", () => {

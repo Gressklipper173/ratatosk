@@ -1,3 +1,4 @@
+import re
 import json
 from types import SimpleNamespace
 
@@ -111,7 +112,7 @@ def test_list_includes_compose_project_and_stats(env, logged_in, monkeypatch):
     assert by["sonarr"]["ports"] == ["8989"]
     assert by["sonarr"]["cpu"] == 1.5 and by["sonarr"]["mem"] == 1000
     assert by["loose"]["project"] is None and by["loose"]["cpu"] is None
-    assert body["groups"] == {"assignments": {}, "custom_groups": [], "on_demand_groups": [], "critical_groups": [], "container_priority": {}, "link_containers": [], "aliases": {}, "group_order": [], "hidden_links": [], "link_groups": [], "disks": [], "layout": {"columns": {}, "hidden": []}}
+    assert body["groups"] == {"assignments": {}, "custom_groups": [], "on_demand_groups": [], "critical_groups": [], "container_priority": {}, "link_containers": [], "aliases": {}, "group_order": [], "hidden_links": [], "link_groups": [], "group_by_project": False, "disks": [], "layout": {"columns": {}, "hidden": []}}
 
 
 def test_compute_stats_cpu_and_memory(env):
@@ -173,7 +174,7 @@ def test_groups_save_and_reload(env, logged_in):
     r = c.put("/api/groups", json=settings, headers={"X-CSRF-Token": csrf})
     assert r.status_code == 200
     # names are trimmed and duplicates dropped
-    expected = {"assignments": {"web": "Frontends"}, "custom_groups": ["Frontends", "Spare"], "on_demand_groups": [], "critical_groups": [], "container_priority": {}, "link_containers": [], "aliases": {}, "group_order": [], "hidden_links": [], "link_groups": [], "disks": [], "layout": {"columns": {}, "hidden": []}}
+    expected = {"assignments": {"web": "Frontends"}, "custom_groups": ["Frontends", "Spare"], "on_demand_groups": [], "critical_groups": [], "container_priority": {}, "link_containers": [], "aliases": {}, "group_order": [], "hidden_links": [], "link_groups": [], "group_by_project": True, "disks": [], "layout": {"columns": {}, "hidden": []}}
     assert c.get("/api/containers").get_json()["groups"] == expected
 
 
@@ -195,7 +196,7 @@ def test_groups_file_from_before_on_demand_setting_still_loads(env, logged_in):
     with open(env.app.GROUPS_PATH, "w") as f:
         json.dump({"assignments": {"web": "A"}, "custom_groups": ["A"]}, f)
     groups = c.get("/api/containers").get_json()["groups"]
-    assert groups == {"assignments": {"web": "A"}, "custom_groups": ["A"], "on_demand_groups": [], "critical_groups": [], "container_priority": {}, "link_containers": [], "aliases": {}, "group_order": [], "hidden_links": [], "link_groups": [], "disks": [], "layout": {"columns": {}, "hidden": []}}
+    assert groups == {"assignments": {"web": "A"}, "custom_groups": ["A"], "on_demand_groups": [], "critical_groups": [], "container_priority": {}, "link_containers": [], "aliases": {}, "group_order": [], "hidden_links": [], "link_groups": [], "group_by_project": True, "disks": [], "layout": {"columns": {}, "hidden": []}}
 
 
 def test_groups_need_csrf(env, logged_in):
@@ -693,3 +694,56 @@ def test_layout_is_optional_when_saving(env, logged_in):
     r = c.put("/api/groups", json={"assignments": {}, "custom_groups": []}, headers={"X-CSRF-Token": csrf})
     assert r.status_code == 200
     assert r.get_json()["groups"]["layout"] == {"columns": {}, "hidden": []}
+
+
+def test_group_by_project_starts_off_on_a_new_account_and_on_for_old_files(env, logged_in):
+    import json
+
+    c, _ = logged_in
+    assert c.get("/api/containers").get_json()["groups"]["group_by_project"] is False
+    # a file saved before the setting existed keeps the old behaviour
+    with open(env.app.GROUPS_PATH, "w") as f:
+        json.dump({"assignments": {}, "custom_groups": []}, f)
+    assert c.get("/api/containers").get_json()["groups"]["group_by_project"] is True
+    # a damaged value is treated as on, not as off
+    with open(env.app.GROUPS_PATH, "w") as f:
+        json.dump({"assignments": {}, "custom_groups": [], "group_by_project": "no"}, f)
+    assert c.get("/api/containers").get_json()["groups"]["group_by_project"] is True
+
+
+def test_group_by_project_off_saves_and_reloads(env, logged_in):
+    c, csrf = logged_in
+    settings = {"assignments": {}, "custom_groups": [], "group_by_project": False}
+    assert c.put("/api/groups", json=settings, headers={"X-CSRF-Token": csrf}).status_code == 200
+    assert c.get("/api/containers").get_json()["groups"]["group_by_project"] is False
+    settings["group_by_project"] = True
+    assert c.put("/api/groups", json=settings, headers={"X-CSRF-Token": csrf}).status_code == 200
+    assert c.get("/api/containers").get_json()["groups"]["group_by_project"] is True
+
+
+@pytest.mark.parametrize("value", ["false", 0, 1, None, [], {}])
+def test_group_by_project_must_be_a_boolean(env, logged_in, value):
+    c, csrf = logged_in
+    settings = {"assignments": {}, "custom_groups": [], "group_by_project": value}
+    assert c.put("/api/groups", json=settings, headers={"X-CSRF-Token": csrf}).status_code == 400
+
+
+def test_creating_the_admin_opens_the_page_on_the_searching_screen(env):
+    c = env.app.app.test_client()
+    r = c.post("/setup", data={"token": env.app.setup_token, "username": "admin", "password": "correct-horse"})
+    assert r.status_code == 302
+    assert r.headers["Location"].endswith("/?welcome=1")
+    shown = c.get("/?welcome=1").get_data(as_text=True)
+    tag = re.search(r'<div class="welcome" id="welcome"[^>]*>', shown).group(0)
+    assert " hidden" not in tag
+    assert "Searching for containers" in shown
+
+
+def test_the_searching_screen_is_hidden_on_a_normal_visit(env, logged_in):
+    c, _ = logged_in
+    page = c.get("/").get_data(as_text=True)
+    tag = re.search(r'<div class="welcome" id="welcome"[^>]*>', page).group(0)
+    assert " hidden" in tag
+    # anything but welcome=1 leaves it hidden
+    tag = re.search(r'<div class="welcome" id="welcome"[^>]*>', c.get("/?welcome=0").get_data(as_text=True)).group(0)
+    assert " hidden" in tag

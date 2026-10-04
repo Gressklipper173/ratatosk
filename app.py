@@ -171,6 +171,8 @@ def empty_groups():
         "group_order": [],
         "hidden_links": [],
         "link_groups": [],
+        # a brand-new account starts with everything in "Ungrouped"
+        "group_by_project": False,
         "disks": [],
         "layout": empty_layout(),
     }
@@ -210,6 +212,9 @@ def load_groups(user=None):
         "group_order": data.get("group_order", []),
         "hidden_links": data.get("hidden_links", []),
         "link_groups": data.get("link_groups", []),
+        # on = a container starts in its Compose project's group; off = in "Ungrouped". Files saved
+        # before this setting existed keep the old behaviour (on); only a brand-new account starts off.
+        "group_by_project": data["group_by_project"] if isinstance(data.get("group_by_project"), bool) else True,
         # the host panel's storage meters; files saved before they existed don't have it
         "disks": data.get("disks", []),
         # files saved before the panel layout existed don't have it; the client then
@@ -291,6 +296,9 @@ def validate_groups(data):
     critical = data.get("critical_groups", [])
     priority = data.get("container_priority", {})
     link_containers = data.get("link_containers", [])
+    by_project = data.get("group_by_project", True)
+    if not isinstance(by_project, bool):
+        return None
     layout = validate_layout(data.get("layout", empty_layout()))
     if layout is None:
         return None
@@ -355,6 +363,8 @@ def validate_groups(data):
         "hidden_links": list(dict.fromkeys(hidden)),
         # groups whose containers get link tiles; off unless the user turns it on
         "link_groups": list(dict.fromkeys(g.strip() for g in link_groups)),
+        # whether containers start in their Compose project's group (default) or in "Ungrouped"
+        "group_by_project": by_project,
         # the host panel's storage meters: [{"label", "path"}]
         "disks": disks,
         # where each panel sits, per column count, and which panels are hidden
@@ -502,7 +512,8 @@ def setup():
     setup_token = None
     activity.log("info", "auth", f"first admin created: {username}")
     start_session(username)
-    return redirect(url_for("index"))
+    # the page shows a "searching for containers" screen once, right after the account is made
+    return redirect(url_for("index", welcome=1))
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -647,7 +658,8 @@ def api_account_password():
 @login_required
 def index():
     return render_template(
-        "index.html", user=session["user"], role=current_user()[1], csrf_token=session["csrf"], read_only=READ_ONLY
+        "index.html", user=session["user"], role=current_user()[1], csrf_token=session["csrf"], read_only=READ_ONLY,
+        welcome=request.args.get("welcome") == "1",
     )
 
 

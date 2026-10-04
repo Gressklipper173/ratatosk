@@ -20,8 +20,8 @@ between the realms.*
 - Optional panels for apps it knows (see [Integrations](#integrations)), and a YAML format for your own
 - A **Debug** button that shows what Ratatosk itself is doing (app requests,
   key steps, sign-ins, errors), so you don't need shell access to find out why a panel is empty
-- Groups: starts from the Docker Compose project, and you can drag containers
-  into groups of your own
+- Groups: everything starts in "Ungrouped" (or in its Docker Compose project, if you switch that on), and you
+  can drag containers into groups of your own
 - Users: an admin adds people as admins or operators, and everyone arranges their own page
 
 **Contents:** [Quick start](#quick-start) · [Updating](#updating-ratatosk) · [Backup and restore](#backup-and-restore) ·
@@ -94,10 +94,16 @@ you are on it). Enter the token, a username (letters, digits, `.`, `_` and `-`, 
 password of at least 8 characters, then press **Create admin**. You are signed in. From now on
 `http://<host>:8090` shows the sign-in page.
 
+Right after the account is created you see a "Searching for containers…" screen while Ratatosk reads the
+container list from Docker. It goes away as soon as the list arrives, even if Ratatosk is the only container on the
+host (the dashboard then just shows the host stats). If the list can't be read within 15 seconds, it asks
+whether to **Proceed to the dashboard** or **Keep searching**, and shows the error. It only appears this once.
+
 ### 7. Look around
 
 - **Host** panel: CPU, memory and storage of the machine.
-- **Container groups**: your containers, grouped by Docker Compose project. Click a row (or its **⋯**
+- **Container groups**: your containers, in one **Ungrouped** group to begin with (drag them into groups
+  of your own, or switch on **Group by Compose project** in Settings). Click a row (or its **⋯**
   button) for **Update** (when a newer image exists), **Logs**, **Restart** and **Stop**.
   Ratatosk's own row says "this instance" and can't be stopped from the page.
 - **Browser tab**: a coloured dot and a count show the overall status.
@@ -336,8 +342,11 @@ only admins see it. There are two roles:
 
 ## Groups
 
-Containers are grouped by their Docker Compose project by default; anything
-without one lands in "Ungrouped" (which only appears while a container is in it). In
+On a new account every container starts in "Ungrouped" (which only appears while a container is in
+it). To start from each container's Docker Compose project instead, switch on **Group by Compose
+project** under **Settings** (the cog) → **Groups**. That setting is saved with your account, and
+containers you placed in a group yourself stay where you put them. Accounts that existed before
+the setting was added keep grouping by project until you switch it off. In
 **Customize**, drag a container onto a group panel to move it, drop it on the "new
 group" zone to start one, or press **Add group**. Each group panel then offers
 **Rename**, **Delete** (user-made groups only), **Priority** and **Generate links**.

@@ -64,6 +64,10 @@
           <option value="5">Up to 5</option>
         </select>
       </label>
+      <h3 class="cfg-section">Groups</h3>
+      <label class="set-field" for="group-by-project"><span>Group by Compose project<small>On: a container starts in its Compose project's group. Off (the default): every container you haven't placed yourself is in "Ungrouped". Saved with your account.</small></span>
+        <input type="checkbox" id="group-by-project">
+      </label>
       <h3 class="cfg-section">Refresh</h3>
       <label class="set-field" for="list-refresh"><span>Containers<small>The container list, host CPU and memory.</small></span>
         <select id="list-refresh"></select>
@@ -84,6 +88,18 @@
       {% endif %}
     </div>
   </dialog>
+
+  <div class="welcome" id="welcome" role="alertdialog" aria-live="polite" aria-labelledby="welcome-title" aria-describedby="welcome-text"{% if not welcome %} hidden{% endif %}>
+    <div class="welcome-card">
+      <div class="spinner" id="welcome-spinner" aria-hidden="true"></div>
+      <h2 id="welcome-title">Searching for containers…</h2>
+      <p class="hint" id="welcome-text">Looking at what is running on this host.</p>
+      <div class="welcome-actions" id="welcome-actions" hidden>
+        <button class="btn" id="welcome-proceed" type="button">Proceed to the dashboard</button>
+        <button class="mini" id="welcome-retry" type="button">Keep searching</button>
+      </div>
+    </div>
+  </div>
 
   <p class="error" id="error" hidden></p>
   <div class="notices" id="notices" hidden></div>
