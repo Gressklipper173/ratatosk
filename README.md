@@ -70,7 +70,10 @@ Open `docker-compose.yml`. The defaults work as they are. The usual changes are:
 - **Read-only mode.** Set `READ_ONLY: "true"` if Ratatosk should only look (see [Configuration](#configuration)).
 - **Extra mounts**, only if you want the Update button or the storage meters to see more of the host.
   The file has commented examples, and the sections [Updates](#updates) and
-  [Storage meters](#storage-meters) explain them. You can add them later.
+  [Storage meters](#storage-meters) explain them. You can add them later. For the Update button each
+  Compose project's folder must be mounted at the **same path as on the host**
+  (`/home/me/media:/home/me/media:ro`); the storage-meter mount is a different thing and does not
+  count. See [Making the Update button work](#making-the-update-button-work).
 
 Don't set `hostname:` or `network_mode: host` on the service. Ratatosk finds its own container by
 the hostname Docker gives it, and needs that to avoid offering to stop itself.
@@ -203,7 +206,12 @@ Then remove the folder if you like.
   mounted. On a host with SELinux, if it still can't read the socket, add
   `label=disable` to the service's `security_opt:` list (the example file already has one).
 - **The page looks old after an update.** Hard refresh (Ctrl+Shift+R).
-- **The Update button is greyed out.** Mount the project's folder at the same path (see [Updates](#updates)).
+- **The Update button is greyed out, tooltip says "compose file not visible to Ratatosk".** Mount that
+  project's folder in Ratatosk's compose file with the same path on both sides, for example
+  `/home/me/media:/home/me/media:ro`, then recreate Ratatosk. How to find the folder, and why
+  `/home:/host/home` does not count: [Making the Update button work](#making-the-update-button-work).
+  If the tooltip says "this image has no docker CLI", the image was built without it; build from this
+  repository's Dockerfile.
 - **An app's panel says it could not reach the app, or shows nothing.** See [Integrations](#integrations);
   the **Debug** button in the page header shows each request and why it failed.
 
@@ -464,10 +472,48 @@ never show an update. The registry check sends the image name to its registry (D
 rate-limits anonymous requests); set `UPDATE_CHECK=false` to turn it off, which also
 removes the button.
 
-The button needs the project's Compose files at the same path inside Ratatosk
-container as on the host. Mount each project's folder that way, for example
-`/home/me/media:/home/me/media:ro`. Without it the button is greyed out and its tooltip
-says which file is missing.
+### Making the Update button work
+
+Ratatosk runs `docker compose` from inside its own container, so it has to see each project's
+Compose files at **the same path as on the host**. Without that the button stays greyed out and its
+tooltip says `compose file not visible to Ratatosk`, followed by the file it looked for. You do this
+once per Compose project that has containers you want to update:
+
+1. **Find the project's folder.** The tooltip already names the file, so the folder is the part
+   before the file name. You can also ask Docker, using any container from that project:
+
+   ```
+   docker inspect <container> --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}'
+   ```
+
+   If the project was started with `-f` or `--project-directory`, the label
+   `com.docker.compose.project.config_files` lists the files themselves.
+2. **Mount that folder in Ratatosk's compose file, with the same path on both sides of the colon**,
+   read-only:
+
+   ```yaml
+   volumes:
+     - /home/me/media:/home/me/media:ro
+   ```
+
+3. **Recreate Ratatosk** (`docker compose up -d` in its own folder) and reload the page.
+
+Things that trip people up:
+
+- **A different mount of the same disk does not count.** The disk-meter example
+  `/home:/host/home:ro` puts the files at `/host/home/...`, not `/home/...`, so Ratatosk still cannot
+  find the compose file at the path Docker recorded. Add the project's own folder as above.
+- **Mount the folder, not just the file.** Compose also reads the `.env` file and any relative paths
+  next to the Compose file.
+- **The folder becomes readable by Ratatosk**, including that project's `.env` and anything else in
+  it. Ratatosk can already control every container through the Docker socket, so this adds little,
+  but keep secrets you don't want it to read in a folder that is not mounted.
+- **Several Compose files in one project** (a base file plus overrides) must all be reachable at their
+  recorded paths. Mounting the folder they sit in covers that if they share one.
+- **On a host with SELinux**, if the file still isn't visible after mounting, see the SELinux note in
+  [Troubleshooting](#troubleshooting).
+- **An update badge can outlive the update.** If you updated the container by hand, the badge clears
+  after the next registry check (every 30 minutes).
 
 ## Integrations
 

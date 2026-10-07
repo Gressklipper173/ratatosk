@@ -36,9 +36,15 @@ services:
       # Grants control of every container on this host (root-equivalent).
       # Keep Ratatosk off the public internet; see README.
       - /var/run/docker.sock:/var/run/docker.sock
-      # Optional, for the Update button: mount each Compose project's folder at the
-      # same path it has on the host (read-only is fine). Example:
+      # Optional, for the Update button. Ratatosk runs `docker compose` from inside its own
+      # container, so it must see each project's folder at the SAME path as on the host, on both
+      # sides of the colon (read-only is fine). Without it the Update button stays greyed out
+      # with "compose file not visible to Ratatosk". One line per project, for example:
       # - /home/me/media:/home/me/media:ro
+      # To find a project's folder:
+      #   docker inspect <container> --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}'
+      # A different mount of the same disk (such as /home:/host/home) does not count. The folder
+      # also holds that project's .env, which Ratatosk can then read.
       # Optional, for your own integration adapters (see docs/ADAPTERS.md):
       # - ./my-adapters:/data/adapters:ro
 
