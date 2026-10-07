@@ -25,10 +25,14 @@ MAX_DEPTH = 6
 MAX_ENTRIES = 500
 MIN_SIZE = 16  # engine boilerplate is often a one-byte stub
 MAX_SIZE = 256 * 1024
+MAX_LINE = 16 * 1024  # a settings line is never this long; longer ones are not parsed or edited as fields
 COMMENT_PREFIXES = (";", "#", "//")
 
-_KEYVALUE = re.compile(r"^(\s*)([^\s=:#;]+)(\s*[=:]\s*)(.*?)\s*$")
-_SECTION = re.compile(r"^\s*\[(.+)\]\s*$")
+# Both are matched against a line with its trailing whitespace already removed, so nothing has to
+# rescan it from every position (a lazy `.*?\s*$` is quadratic on a long run of spaces).
+_KEYVALUE = re.compile(r"^(\s*)([^\s=:#;]+)(\s*[=:]\s*)(.*)$")
+_SECTION = re.compile(r"^\s*\[(.+)\]$")
+_LINES = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+")
 
 
 class EditError(ValueError):
@@ -58,6 +62,20 @@ def safe_path(path):
 
 # ---- parsing -----------------------------------------------------------------------------
 
+def _ending(line):
+    for end in ("\r\n", "\n", "\r"):
+        if line.endswith(end):
+            return line[: -len(end)], end
+    return line, ""
+
+
+def _split(text):
+    """The lines of `text`, each with its terminator. Only `\\n`, `\\r\\n` and a lone `\\r` end a
+    line, unlike str.splitlines, which also breaks on \\x0b, \\x85, \\u2028 and others that the game
+    does not treat as breaks. Parsing and rewriting both go through here, so they agree."""
+    return _LINES.findall(text)
+
+
 def _is_comment(line):
     return line.strip().startswith(COMMENT_PREFIXES)
 
@@ -75,10 +93,13 @@ def _kind(value):
 
 def _split_struct(inner):
     """The comma-separated parts of a struct body, ignoring commas inside quotes or parentheses."""
-    parts, depth, quoted, start = [], 0, False, 0
-    for i, ch in enumerate(inner):
+    parts, depth, quoted, start, i = [], 0, False, 0, 0
+    while i < len(inner):
+        ch = inner[i]
         if quoted:
-            if ch == '"' and inner[i - 1] != "\\":
+            if ch == "\\":
+                i += 1  # a backslash escapes the next character, so `\\"` ends the text and `\"` does not
+            elif ch == '"':
                 quoted = False
         elif ch == '"':
             quoted = True
@@ -89,6 +110,7 @@ def _split_struct(inner):
         elif ch == "," and depth == 0:
             parts.append(inner[start:i])
             start = i + 1
+        i += 1
     parts.append(inner[start:])
     return parts
 
@@ -145,13 +167,14 @@ def parse(text):
     """{"format": "keyvalue"|"list", "entries": [...], "header": [comment line, ...]}. Every entry has `line` (0-based) and
     `value`; key/value entries also have `key`, `section`, `type`, `comment` (the comment lines right above
     the setting, if any) and, for packed structs, `fields`."""
-    lines = text.splitlines()
+    # a line over MAX_LINE is not looked at (it reads as blank, so line numbers still match `render`)
+    lines = ["" if len(line) > MAX_LINE else _ending(line)[0] for line in _split(text)]
     content = pairs = 0
     for line in lines:
         if not line.strip() or _is_comment(line):
             continue
         content += 1
-        if not _SECTION.match(line) and _KEYVALUE.match(line):
+        if not _SECTION.match(line.rstrip()) and _KEYVALUE.match(line.rstrip()):
             pairs += 1
     fmt = "keyvalue" if content and pairs * 2 >= content else "list"
 
@@ -168,12 +191,12 @@ def parse(text):
         if fmt == "list":
             entries.append({"line": number, "value": line.strip()})
             continue
-        header_match = _SECTION.match(line)
+        header_match = _SECTION.match(line.rstrip())
         if header_match:
             section = header_match.group(1)
             notes = []
             continue
-        match = _KEYVALUE.match(line)
+        match = _KEYVALUE.match(line.rstrip())
         if not match:
             notes = []
             continue
@@ -191,7 +214,8 @@ def parse(text):
 # ---- writing back ------------------------------------------------------------------------
 
 def _one_line(value):
-    if not isinstance(value, str) or "\n" in value or "\r" in value or "\x00" in value:
+    # splitlines also breaks on \x0b, \x0c, \x85, \u2028 and others; the "x" catches a trailing break
+    if not isinstance(value, str) or "\x00" in value or len((value + "x").splitlines()) > 1:
         raise EditError("a value can't contain a line break")
     return value
 
@@ -201,13 +225,18 @@ def _render_struct(original, edits):
     for part in _split_struct(original.strip()[1:-1]):
         name, sep, raw = part.partition("=")
         key = name.strip()
-        if not sep or key not in edits or _is_struct(raw):
-            out.append(part)  # untouched, and nested structs are never rewritten
+        if not sep or key not in edits:
+            out.append(part)  # untouched
             continue
+        if _is_struct(raw):
+            raise EditError(f"{key}: a nested list or struct can't be edited here; use raw text")
         new = _one_line(edits[key])
         if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
-            if re.search(r'(?<!\\)"', new):
+            # a quote counts as unescaped when an even number of backslashes (maybe none) comes before it
+            if re.search(r'(?<!\\)(?:\\\\)*"', new):
                 raise EditError(f"{key}: a quote inside the text must be written as \\\"")
+            if (len(new) - len(new.rstrip("\\"))) % 2:
+                raise EditError(f"{key}: the text can't end in a single backslash, which would escape the closing quote")
             out.append(f'{name}="{new}"')
         else:
             if any(c in new for c in ',()"'):
@@ -216,20 +245,15 @@ def _render_struct(original, edits):
     return "(" + ",".join(out) + ")"
 
 
-def _ending(line):
-    for end in ("\r\n", "\n"):
-        if line.endswith(end):
-            return line[: -len(end)], end
-    return line, ""
-
-
 def render(original, fmt, edits):
     """`original` with the edits applied.
 
     key/value: `edits` maps a line number (as in `parse`) to the new value text, or, for a packed
     struct, to {setting: new value} for the settings that changed.
     list: `edits` is {"entries": [value, ...]}, the whole list as it should now read."""
-    lines = original.splitlines(keepends=True)
+    lines = _split(original)
+    if any(len(line) > MAX_LINE for line in lines):
+        raise EditError("this file has a line that is too long to edit as fields; use raw text")
 
     if fmt == "keyvalue":
         for number, new in edits.items():
@@ -240,7 +264,7 @@ def render(original, fmt, edits):
             if not 0 <= index < len(lines):
                 raise EditError("unknown line")
             body, end = _ending(lines[index])
-            match = _KEYVALUE.match(body)
+            match = _KEYVALUE.match(body.rstrip())
             if not match or _is_comment(body):
                 raise EditError("that line is not a setting any more; reload the file")
             lead, key, sep, value = match.groups()
@@ -257,6 +281,9 @@ def render(original, fmt, edits):
     if not isinstance(entries, list):
         raise EditError("a list file needs its entries")
     pending = [_one_line(e).strip() for e in entries if str(e).strip()]
+    for entry in pending:
+        if _is_comment(entry):
+            raise EditError(f"{entry}: an entry can't start with ; # or //, it would read as a comment")
     out = []
     for line in lines:
         if not line.strip() or _is_comment(line):
@@ -264,7 +291,7 @@ def render(original, fmt, edits):
         elif pending:
             out.append(pending.pop(0) + (_ending(line)[1] or "\n"))
         # else: this entry was removed
-    if pending and out and not out[-1].endswith("\n"):
+    if pending and out and not out[-1].endswith(("\n", "\r")):
         out[-1] += "\n"
     out += [e + "\n" for e in pending]
     return "".join(out)

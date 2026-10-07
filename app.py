@@ -5,8 +5,10 @@ import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
+from datetime import timedelta
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
@@ -29,6 +31,14 @@ READ_ONLY = os.environ.get("READ_ONLY", "").lower() in ("1", "true", "yes")
 # address comes from the proxy's header instead of the socket, and the page may be served over
 # https. Off by default: a header is only trustworthy when nothing else can reach the dashboard.
 BEHIND_PROXY = os.environ.get("BEHIND_PROXY", "").lower() in ("1", "true", "yes")
+# Which header carries the visitor's address when BEHIND_PROXY is on: "xff" (the last
+# X-Forwarded-For entry, which any proxy appends) or "cf" (Cloudflare's CF-Connecting-IP).
+# Only one is trusted, because only the proxy's own header is overwritten on the way in; the
+# other can be forged by the visitor. Anything else falls back to "xff".
+PROXY_IP_HEADER = os.environ.get("PROXY_IP_HEADER", "xff").strip().lower()
+_proxy_header_invalid = PROXY_IP_HEADER not in ("xff", "cf")
+if _proxy_header_invalid:
+    PROXY_IP_HEADER = "xff"
 # Storage meters in the host panel. A container can't see the host's disks, so each meter is a
 # folder the admin mounted from a disk (only that disk's size and free space are read). Until
 # one is added in the page, the dashboard's own volume is shown: /data sits on the same disk as
@@ -37,6 +47,12 @@ DEFAULT_DISKS = [{"label": "Storage", "path": "/data"}]
 MAX_DISKS = 8
 MAX_DISK_LABEL = 32
 MAX_DISK_PATH = 200
+
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")) as f:
+        VERSION = f.read().strip() or "dev"
+except OSError:
+    VERSION = "dev"
 
 USERS_PATH = os.path.join(DATA_DIR, "users.json")
 SECRET_PATH = os.path.join(DATA_DIR, "secret_key")
@@ -55,6 +71,8 @@ ADAPTERS, ADAPTER_PROBLEMS = integrations.load_adapters(
 activity.capture_python_logging()
 for _problem in ADAPTER_PROBLEMS:
     activity.log("warn", "adapters", f"skipped {_problem}")
+if _proxy_header_invalid:
+    activity.log("warn", "app", 'PROXY_IP_HEADER must be "xff" or "cf"; using "xff"')
 PANEL_TTL = 30
 
 
@@ -105,6 +123,13 @@ UPDATE_TIMEOUT = 900
 MAX_FAILURES = 5
 FAILURE_WINDOW = 300
 
+# a signed-in session lasts this long after its last request; sign-in is needed again after that
+SESSION_LIFETIME = timedelta(hours=12)
+
+# One lock around every read-modify-write of users.json and integrations.json, so two admin
+# actions at the same moment can't overwrite each other (gunicorn runs several threads).
+_data_lock = threading.RLock()
+
 
 def load_secret_key():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -119,6 +144,11 @@ def load_secret_key():
         return key
 
 
+class DataFileError(RuntimeError):
+    """A data file that exists but can't be trusted. Never answered with an empty default for
+    users.json: an empty user list would hand /setup to whoever reaches the page next."""
+
+
 ROLES = ("admin", "operator")
 PRIORITIES = ("critical", "wanted", "on_demand")
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
@@ -127,12 +157,17 @@ MIN_PASSWORD = 8
 
 def load_users():
     """{username: {"hash", "role"}}. A file saved before roles existed holds {username: hash};
-    those accounts were all admins, so they stay admins."""
+    those accounts were all admins, so they stay admins. A file that is unreadable, not JSON or
+    not an object raises DataFileError instead of reading as "no users" (see above)."""
     try:
         with open(USERS_PATH) as f:
             raw = json.load(f)
     except FileNotFoundError:
         return {}
+    except (OSError, ValueError) as e:
+        raise DataFileError(f"{USERS_PATH} can't be read ({type(e).__name__}: {e}). Fix or restore it; Ratatosk will not treat it as empty, which would re-open /setup") from e
+    if not isinstance(raw, dict):
+        raise DataFileError(f"{USERS_PATH} is not a JSON object. Fix or restore it; Ratatosk will not treat it as empty, which would re-open /setup")
     users = {}
     for name, rec in raw.items():
         if isinstance(rec, str):
@@ -140,15 +175,25 @@ def load_users():
         if isinstance(rec, dict) and isinstance(rec.get("hash"), str):
             role = rec.get("role")
             users[name] = {"hash": rec["hash"], "role": role if role in ROLES else "operator"}
+    if raw and not users:
+        raise DataFileError(f"{USERS_PATH} has no usable account in it. Fix or restore it; Ratatosk will not treat it as empty, which would re-open /setup")
     return users
 
 
 def write_json(path, data):
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f)
-    os.replace(tmp, path)
+    """Atomic replace through a temp file of its own (mkstemp: unique name, mode 0600), so two
+    writers never share one."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def save_users(users):
@@ -184,17 +229,31 @@ def groups_path(user):
     return os.path.join(GROUPS_DIR, hashlib.sha256(user.encode()).hexdigest()[:24] + ".json")
 
 
+_groups_warned = set()
+
+
 def load_groups(user=None):
     """The user's own settings. Until they save for the first time they see the shared
-    groups.json that existed before users had their own, so nobody starts from an empty page."""
+    groups.json that existed before users had their own, so nobody starts from an empty page.
+    A file that is unreadable or not an object is skipped with one warning (a display
+    preference is not worth a crash), and the defaults apply."""
     data = None
     for path in ([groups_path(user)] if user else []) + [GROUPS_PATH]:
         try:
             with open(path) as f:
                 data = json.load(f)
-            break
-        except (FileNotFoundError, json.JSONDecodeError):
+        except FileNotFoundError:
             continue
+        except (OSError, ValueError) as e:
+            data = None
+            problem = f"{type(e).__name__}: {e}"
+        else:
+            if isinstance(data, dict):
+                break
+            data, problem = None, "not a JSON object"
+        if path not in _groups_warned:
+            _groups_warned.add(path)
+            activity.log("warn", "app", f"{path} was ignored ({problem}); using default group settings")
     if data is None:
         return empty_groups()
     return {
@@ -374,21 +433,37 @@ def validate_groups(data):
 
 app = Flask(__name__)
 app.secret_key = load_secret_key()
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=SESSION_LIFETIME)
+
+# Every script and stylesheet is a file of ours, and the page is never framed. Styles set from
+# script go through el.style.x (allowed); a style="" attribute or inline <style> would be blocked.
+CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; frame-ancestors 'none'"
+
+
+@app.after_request
+def security_headers(resp):
+    resp.headers.setdefault("Content-Security-Policy", CSP)
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    # the API answers hold container details and config files, and the pages hold the CSRF token
+    if request.path.startswith("/api/") or resp.mimetype == "text/html":
+        resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
 
 
 def client_ip():
-    """Who is asking. Behind a trusted proxy that is the address it reports (Cloudflare's
-    CF-Connecting-IP, else the last X-Forwarded-For entry, which the proxy itself appended);
-    otherwise the socket's peer. Without this every visitor behind a tunnel shares one address,
-    so the login throttle would lock everyone out together."""
+    """Who is asking. Behind a trusted proxy that is the address the proxy reports in the one
+    header PROXY_IP_HEADER names (the last X-Forwarded-For entry, which the proxy itself
+    appended, or Cloudflare's CF-Connecting-IP); the other header is ignored, since a visitor
+    can forge it. Otherwise the socket's peer. Without this every visitor behind a tunnel
+    shares one address, so the login throttle would lock everyone out together."""
     if BEHIND_PROXY:
-        cf = request.headers.get("CF-Connecting-IP", "").strip()
-        if cf:
-            return cf[:64]
-        fwd = request.headers.get("X-Forwarded-For", "").split(",")[-1].strip()
-        if fwd:
-            return fwd[:64]
+        if PROXY_IP_HEADER == "cf":
+            ip = request.headers.get("CF-Connecting-IP", "").strip()
+        else:
+            ip = request.headers.get("X-Forwarded-For", "").split(",")[-1].strip()
+        if ip:
+            return ip[:64]
     return request.remote_addr
 
 
@@ -417,6 +492,9 @@ activity.log("info", "app", f"started{' (read-only)' if READ_ONLY else ''}")
 def log_unhandled(e):
     if isinstance(e, HTTPException):
         return e
+    if isinstance(e, DataFileError):
+        activity.log("error", "app", f"{request.method} {request.path} refused: {e}")
+        return jsonify({"error": "a data file is damaged, see the Debug panel or the container logs"}), 503
     activity.log("error", "app", f"{request.method} {request.path} failed: {type(e).__name__}: {e}", exc=True)
     return jsonify({"error": "internal error, see the Debug panel"}), 500
 
@@ -429,12 +507,17 @@ if not load_users():
     print(f"[setup] No users yet. Open /setup and use token: {setup_token}", flush=True)
 
 _failures = {}
+# checked when the user doesn't exist, so an unknown name costs the same time as a wrong password
+_DUMMY_HASH = generate_password_hash("not-a-real-password")
 
 
 def throttled(ip):
     now = time.time()
     recent = [t for t in _failures.get(ip, []) if now - t < FAILURE_WINDOW]
-    _failures[ip] = recent
+    if recent:
+        _failures[ip] = recent
+    else:
+        _failures.pop(ip, None)
     return len(recent) >= MAX_FAILURES
 
 
@@ -442,12 +525,21 @@ def record_failure(ip):
     _failures.setdefault(ip, []).append(time.time())
 
 
+def _password_stamp(rec):
+    """A short fingerprint of the stored password hash. A session carries it, so changing or
+    resetting the password signs out every session that was opened with the old one."""
+    return hashlib.sha256(rec["hash"].encode()).hexdigest()[:16]
+
+
 def current_user():
     """(username, role) of the signed-in user, or (None, None). The role is read from the file
-    on every call, so removing or demoting someone takes effect at once."""
+    on every call, so removing or demoting someone takes effect at once, and a session opened
+    before the last password change is no longer signed in."""
     name = session.get("user")
     rec = load_users().get(name) if name else None
-    return (name, rec["role"]) if rec else (None, None)
+    if rec and session.get("pw") == _password_stamp(rec):
+        return name, rec["role"]
+    return None, None
 
 
 def login_required(view):
@@ -480,13 +572,37 @@ def admin_required(view):
 
 def start_session(username):
     session.clear()
+    session.permanent = True  # PERMANENT_SESSION_LIFETIME applies
     session["user"] = username
+    session["pw"] = _password_stamp(load_users()[username])
     session["csrf"] = secrets.token_hex(16)
 
 
-def csrf_ok():
-    token = request.headers.get("X-CSRF-Token", "")
-    return bool(token) and secrets.compare_digest(token, session.get("csrf", ""))
+def _safe_eq(a, b):
+    """Constant-time equality for two strings. compare_digest raises on non-ASCII str, so
+    compare the encoded bytes: odd input is simply unequal."""
+    return secrets.compare_digest(a.encode("utf-8", "surrogatepass"), b.encode("utf-8", "surrogatepass"))
+
+
+def csrf_ok(form=False):
+    """The page sends its token in the X-CSRF-Token header. A plain HTML form (the log-out
+    button) can't set headers, so with form=True a `csrf_token` form field counts too."""
+    token = request.headers.get("X-CSRF-Token", "") or (request.form.get("csrf_token", "") if form else "")
+    return bool(token) and _safe_eq(token, session.get("csrf", ""))
+
+
+def _pre_csrf():
+    """The token the login and setup forms carry. There is no session yet, so it lives in the
+    cookie until the sign-in replaces the session; it stops another site logging a visitor in
+    to an account of its own."""
+    if not session.get("csrf_pre"):
+        session["csrf_pre"] = secrets.token_hex(16)
+    return session["csrf_pre"]
+
+
+def _pre_csrf_ok():
+    token = request.form.get("csrf_token", "")
+    return bool(token) and _safe_eq(token, session.get("csrf_pre", ""))
 
 
 @app.route("/setup", methods=["GET", "POST"])
@@ -495,18 +611,22 @@ def setup():
     if setup_token is None:
         return redirect(url_for("login"))
     if request.method == "GET":
-        return render_template("setup.html", error=None)
+        return render_template("setup.html", error=None, csrf_token=_pre_csrf())
+    if not _pre_csrf_ok():
+        return render_template("setup.html", error="This page expired, try again", csrf_token=_pre_csrf()), 403
 
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
     token = request.form.get("token", "")
     error = None
-    if not secrets.compare_digest(token, setup_token):
+    if not _safe_eq(token, setup_token):
         error = "Invalid setup token (see the container logs)"
-    elif not username or len(password) < 8:
-        error = "Username required and password must be at least 8 characters"
+    elif not USERNAME_RE.match(username):
+        error = "Username: 1 to 32 letters, digits, dots, dashes or underscores"
+    elif not _valid_password(password):
+        error = f"Password must be at least {MIN_PASSWORD} characters (256 at most)"
     if error:
-        return render_template("setup.html", error=error)
+        return render_template("setup.html", error=error, csrf_token=_pre_csrf())
 
     save_users({username: {"hash": generate_password_hash(password), "role": "admin"}})
     setup_token = None
@@ -521,26 +641,35 @@ def login():
     if setup_token is not None:
         return redirect(url_for("setup"))
     if request.method == "GET":
-        return render_template("login.html", error=None)
+        return render_template("login.html", error=None, csrf_token=_pre_csrf())
+    if not _pre_csrf_ok():
+        return render_template("login.html", error="This page expired, try again", csrf_token=_pre_csrf()), 403
 
     ip = client_ip()
     if throttled(ip):
         activity.log("warn", "auth", f"login from {ip} refused: too many failures")
-        return render_template("login.html", error="Too many attempts, try again later"), 429
+        return render_template("login.html", error="Too many attempts, try again later", csrf_token=_pre_csrf()), 429
     username = request.form.get("username", "")
     password = request.form.get("password", "")
     stored = load_users().get(username)
-    if stored and check_password_hash(stored["hash"], password):
+    # always hash-check, so an unknown name takes as long as a wrong password
+    password_ok = check_password_hash(stored["hash"] if stored else _DUMMY_HASH, password)
+    if stored and password_ok:
         start_session(username)
         activity.log("info", "auth", f"{username} signed in from {ip}")
         return redirect(url_for("index"))
     record_failure(ip)
     activity.log("warn", "auth", f"failed sign-in from {ip}")
-    return render_template("login.html", error="Invalid username or password"), 401
+    return render_template("login.html", error="Invalid username or password", csrf_token=_pre_csrf()), 401
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
 def logout():
+    # POST with the CSRF token (header, or the csrf_token field of a plain form), so another
+    # site can't sign a visitor out with an image tag. Someone already signed out just lands on
+    # the login page.
+    if session.get("csrf") and not csrf_ok(form=True):
+        return jsonify({"error": "bad csrf token"}), 403
     session.clear()
     return redirect(url_for("login"))
 
@@ -562,8 +691,8 @@ def _valid_password(pw):
 @app.route("/api/users", methods=["GET", "POST"])
 @admin_required
 def api_users():
-    users = load_users()
     if request.method == "GET":
+        users = load_users()
         return jsonify({"error": None, "me": session["user"], "items": [{"name": n, "role": u["role"]} for n, u in sorted(users.items())]})
     if READ_ONLY:
         return _user_error("Ratatosk is in read-only mode", 403)
@@ -578,10 +707,13 @@ def api_users():
         return _user_error("pick a role")
     if not _valid_password(password):
         return _user_error(f"password must be at least {MIN_PASSWORD} characters")
-    if name in users:
-        return _user_error("that username is taken", 409)
-    users[name] = {"hash": generate_password_hash(password), "role": role}
-    save_users(users)
+    hashed = generate_password_hash(password)
+    with _data_lock:
+        users = load_users()
+        if name in users:
+            return _user_error("that username is taken", 409)
+        users[name] = {"hash": hashed, "role": role}
+        save_users(users)
     activity.log("info", "auth", f"{session['user']} created {role} {name}")
     return jsonify({"error": None})
 
@@ -593,39 +725,40 @@ def api_user(name):
         return _user_error("Ratatosk is in read-only mode", 403)
     if not csrf_ok():
         return _user_error("bad csrf token", 403)
-    users = load_users()
-    if name not in users:
-        return _user_error("no such user", 404)
-    if request.method == "DELETE":
-        if users[name]["role"] == "admin" and _admin_count(users) == 1:
-            return _user_error("this is the only admin; make another admin first", 409)
-        del users[name]
-        save_users(users)
-        try:
-            os.remove(groups_path(name))
-        except FileNotFoundError:
-            pass
-        activity.log("info", "auth", f"{session['user']} removed {name}")
-        return jsonify({"error": None})
     body = request.get_json(silent=True)
     body = body if isinstance(body, dict) else {}
-    role, password = body.get("role"), body.get("password")
-    if role is None and password is None:
-        return _user_error("nothing to change")
-    if role is not None:
-        if role not in ROLES:
-            return _user_error("pick a role")
-        if users[name]["role"] == "admin" and role != "admin" and _admin_count(users) == 1:
-            return _user_error("this is the only admin; make another admin first", 409)
-    if password is not None and not _valid_password(password):
-        return _user_error(f"password must be at least {MIN_PASSWORD} characters")
-    if role is not None:
-        users[name]["role"] = role
-        activity.log("info", "auth", f"{session['user']} set {name} to {role}")
-    if password is not None:
-        users[name]["hash"] = generate_password_hash(password)
-        activity.log("info", "auth", f"{session['user']} reset the password of {name}")
-    save_users(users)
+    with _data_lock:
+        users = load_users()
+        if name not in users:
+            return _user_error("no such user", 404)
+        if request.method == "DELETE":
+            if users[name]["role"] == "admin" and _admin_count(users) == 1:
+                return _user_error("this is the only admin; make another admin first", 409)
+            del users[name]
+            save_users(users)
+            try:
+                os.remove(groups_path(name))
+            except FileNotFoundError:
+                pass
+            activity.log("info", "auth", f"{session['user']} removed {name}")
+            return jsonify({"error": None})
+        role, password = body.get("role"), body.get("password")
+        if role is None and password is None:
+            return _user_error("nothing to change")
+        if role is not None:
+            if role not in ROLES:
+                return _user_error("pick a role")
+            if users[name]["role"] == "admin" and role != "admin" and _admin_count(users) == 1:
+                return _user_error("this is the only admin; make another admin first", 409)
+        if password is not None and not _valid_password(password):
+            return _user_error(f"password must be at least {MIN_PASSWORD} characters")
+        if role is not None:
+            users[name]["role"] = role
+            activity.log("info", "auth", f"{session['user']} set {name} to {role}")
+        if password is not None:
+            users[name]["hash"] = generate_password_hash(password)
+            activity.log("info", "auth", f"{session['user']} reset the password of {name}")
+        save_users(users)
     return jsonify({"error": None})
 
 
@@ -640,25 +773,42 @@ def api_account_password():
     body = request.get_json(silent=True)
     body = body if isinstance(body, dict) else {}
     current, new = body.get("current"), body.get("new")
-    users = load_users()
-    me = users[session["user"]]
-    if not isinstance(current, str) or not check_password_hash(me["hash"], current):
-        record_failure(ip)
-        activity.log("warn", "auth", f"{session['user']}: wrong current password when changing it")
-        return _user_error("the current password is wrong", 403)
-    if not _valid_password(new):
-        return _user_error(f"password must be at least {MIN_PASSWORD} characters")
-    me["hash"] = generate_password_hash(new)
-    save_users(users)
+    with _data_lock:
+        users = load_users()
+        me = users[session["user"]]
+        if not isinstance(current, str) or not check_password_hash(me["hash"], current):
+            record_failure(ip)
+            activity.log("warn", "auth", f"{session['user']}: wrong current password when changing it")
+            return _user_error("the current password is wrong", 403)
+        if not _valid_password(new):
+            return _user_error(f"password must be at least {MIN_PASSWORD} characters")
+        me["hash"] = generate_password_hash(new)
+        save_users(users)
+    session["pw"] = _password_stamp(me)  # this device stays signed in; every other session is signed out
     activity.log("info", "auth", f"{session['user']} changed their password")
     return jsonify({"error": None})
+
+
+@app.route("/healthz")
+def healthz():
+    """For Docker's HEALTHCHECK and uptime monitors. No sign-in, and nothing in it but "ok".
+    Once the first account exists it also asks Docker, so a missing or broken socket mount
+    shows as unhealthy (503). Before that, the setup page is the thing to reach, so it is ok."""
+    if setup_token is None:
+        try:
+            alive = docker_client.ping()
+        except Exception:
+            alive = False
+        if not alive:
+            return jsonify({"ok": False}), 503
+    return jsonify({"ok": True})
 
 
 @app.route("/")
 @login_required
 def index():
     return render_template(
-        "index.html", user=session["user"], role=current_user()[1], csrf_token=session["csrf"], read_only=READ_ONLY,
+        "index.html", version=VERSION, user=session["user"], role=current_user()[1], csrf_token=session["csrf"], read_only=READ_ONLY,
         welcome=request.args.get("welcome") == "1",
     )
 
@@ -666,6 +816,10 @@ def index():
 def own_container_id():
     # inside a container, HOSTNAME defaults to the short container id
     return os.environ.get("HOSTNAME", "")
+
+
+def is_self(c):
+    return bool(own_container_id()) and c.short_id.startswith(own_container_id()[:12])
 
 
 def compute_stats(raw):
@@ -728,12 +882,12 @@ psutil.cpu_percent(interval=None)
 
 
 def pick_link(labels, ports):
-    """The link tile for a container, or None. `dashboard.url` wins when it is an
+    """The link tile for a container, or None. the `ratatosk.url` label wins when it is an
     http(s) URL; otherwise the best published TCP port that is reachable from other
     machines (the client supplies the host name, from the address bar)."""
-    if str(labels.get("dashboard.hide", "")).lower() in ("1", "true", "yes"):
+    if integrations.label(labels, "hide").lower() in ("1", "true", "yes"):
         return None
-    url = labels.get("dashboard.url", "").strip()
+    url = integrations.label(labels, "url").strip()
     if url:
         parsed = urlparse(url)
         if parsed.scheme in ("http", "https") and parsed.netloc:
@@ -787,7 +941,7 @@ def local_digests(c):
     return {d.partition("@")[2] for d in repo_digests if "@" in d}
 
 
-def image_ref(c, labels):
+def image_ref(c):
     ref = c.attrs.get("Config", {}).get("Image", "")
     return "" if ref.startswith("sha256:") else ref
 
@@ -799,14 +953,15 @@ def check_registry():
         for c in docker_client.containers.list():
             labels = c.attrs.get("Config", {}).get("Labels") or {}
             if compose_info(labels) and local_digests(c):
-                refs.add(image_ref(c, labels))
-    except docker.errors.DockerException:
+                refs.add(image_ref(c))
+    except docker.errors.DockerException as e:
+        activity.log("warn", "updates", f"update check could not list containers: {e}")
         return
     for ref in refs - {""}:
         try:
             _registry[ref] = docker_client.images.get_registry_data(ref).id
-        except Exception:
-            pass
+        except Exception as e:
+            activity.log("warn", "updates", f"registry check for {ref} failed: {type(e).__name__}: {e}")
 
 
 def _update_checker():
@@ -833,11 +988,20 @@ def update_info(c, labels):
         return None
     with _jobs_lock:
         job = _jobs.get(c.name)
-    if job:
+    if job and job["state"] == "running":
         return {"available": True, "state": job["state"], "error": job["error"], "blocked": update_blockers(info[2])}
-    latest = _registry.get(image_ref(c, labels))
+    latest = _registry.get(image_ref(c))
     local = local_digests(c)
-    if not latest or not local or latest in local:
+    pending = bool(latest and local and latest not in local)
+    if job:
+        if pending:
+            return {"available": True, "state": job["state"], "error": job["error"], "blocked": update_blockers(info[2])}
+        # a failed update whose container has since been updated by hand: nothing left to show
+        with _jobs_lock:
+            if _jobs.get(c.name) is job:
+                del _jobs[c.name]
+        return None
+    if not pending:
         return None
     return {"available": True, "state": None, "error": None, "blocked": update_blockers(info[2])}
 
@@ -901,7 +1065,7 @@ def describe(c):
         "status": c.status,
         "health": (state.get("Health") or {}).get("Status"),
         "ports": published,
-        "label_name": labels.get("dashboard.name") or None,
+        "label_name": integrations.label(labels, "name") or None,
         "link": pick_link(labels, ports),
         "project": labels.get("com.docker.compose.project"),
         "service": labels.get("com.docker.compose.service"),
@@ -909,7 +1073,7 @@ def describe(c):
         "game": game_info(c, labels),
         "cpu": stats.get("cpu"),
         "mem": stats.get("mem"),
-        "self": bool(own_container_id()) and c.short_id.startswith(own_container_id()[:12]),
+        "self": is_self(c),
     }
 
 
@@ -924,7 +1088,8 @@ def api_containers():
     except docker.errors.DockerException as e:
         return jsonify({"error": str(e), "items": []}), 502
     items.sort(key=lambda i: i["name"])
-    return jsonify({"error": None, "items": items, "read_only": READ_ONLY, "user": current_user()[0], "role": current_user()[1], "groups": load_groups(session["user"])})
+    user, role = current_user()
+    return jsonify({"error": None, "items": items, "read_only": READ_ONLY, "version": VERSION, "user": user, "role": role, "groups": load_groups(session["user"])})
 
 
 @app.route("/api/groups", methods=["PUT"])
@@ -1008,7 +1173,7 @@ def container_logs(name):
 
 
 @app.route("/api/containers/<name>/update", methods=["POST"])
-@login_required
+@admin_required
 def container_update(name):
     if READ_ONLY:
         return jsonify({"error": "Ratatosk is in read-only mode"}), 403
@@ -1022,9 +1187,9 @@ def container_update(name):
         return jsonify({"error": "no such container"}), 404
     except docker.errors.DockerException as e:
         return jsonify({"error": str(e)}), 500
-    d = describe(c)
-    if d["self"]:
+    if is_self(c):
         return jsonify({"error": "Ratatosk can't update its own container"}), 400
+    d = describe(c)
     if not d["update"]:
         return jsonify({"error": "no update available"}), 400
     if d["update"]["blocked"]:
@@ -1103,7 +1268,7 @@ def container_action(name, action):
         return jsonify({"error": "unknown action"}), 400
     try:
         c = docker_client.containers.get(name)
-        if describe(c)["self"]:
+        if is_self(c):
             return jsonify({"error": "Ratatosk can't control its own container"}), 400
         if is_game_server(c.attrs.get("Config", {}).get("Labels") or {}):
             # Wings owns a game server's lifecycle: a stop sent straight to Docker looks like a
@@ -1148,7 +1313,7 @@ def container_delete(name):
         return jsonify({"error": "volumes must be true or false"}), 400
     try:
         c = docker_client.containers.get(name)
-        if describe(c)["self"]:
+        if is_self(c):
             return jsonify({"error": "Ratatosk can't delete its own container"}), 400
         if is_game_server(c.attrs.get("Config", {}).get("Labels") or {}):
             return jsonify({"error": "This container belongs to Wings. Delete the server in Pelican instead"}), 400
@@ -1262,8 +1427,8 @@ def config_file(name):
 
 # ---- debug panel ----------------------------------------------------------
 #
-# Reads the in-memory activity log (activity.py). Like container logs it is visible to every
-# signed-in user, also in READ_ONLY; the level switch only changes what gets recorded.
+# Reads the in-memory activity log (activity.py). Admins only: it holds container names, internal
+# addresses and error text. Also open in READ_ONLY; the level switch only changes what gets recorded.
 
 _secret_cache = (None, ())
 
@@ -1289,7 +1454,7 @@ activity.set_secret_source(_stored_secrets)
 
 
 @app.route("/api/debug")
-@login_required
+@admin_required
 def api_debug():
     since = request.args.get("since", 0, type=int)
     entries, last = activity.snapshot(since)
@@ -1297,7 +1462,7 @@ def api_debug():
 
 
 @app.route("/api/debug/level", methods=["POST"])
-@login_required
+@admin_required
 def api_debug_level():
     if not csrf_ok():
         return jsonify({"error": "bad csrf token"}), 403
@@ -1324,7 +1489,9 @@ def load_integrations():
     try:
         with open(INTEGRATIONS_PATH) as f:
             data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
         data = {}
     keys = data.get("keys", {})
     dismissed = data.get("dismissed", [])
@@ -1338,15 +1505,12 @@ def save_integrations(data):
     write_json(INTEGRATIONS_PATH, data)
     _panel_cache.clear()
     handlers.pelican_forget()
+    handlers.forget_sessions()
 
 
 def adapter_for(c):
     labels = c.attrs.get("Config", {}).get("Labels") or {}
-    return integrations.match_adapter(ADAPTERS, labels, image_ref(c, labels))
-
-
-def is_self(c):
-    return bool(own_container_id()) and c.short_id.startswith(own_container_id()[:12])
+    return integrations.match_adapter(ADAPTERS, labels, image_ref(c))
 
 
 def fetch_panels(c, spec, key, ttl=PANEL_TTL):
@@ -1473,10 +1637,13 @@ def _store_key(c, spec, secret):
     if problem:
         activity.log("warn", "integrations", f"{spec['id']} credentials for {c.name} not stored: {problem}")
         return jsonify({"error": problem}), 400
-    store = load_integrations()
-    store["keys"][c.name] = {**existing, **secret} if existing is not None else secret
-    store["dismissed"] = [n for n in store["dismissed"] if n != c.name]
-    save_integrations(store)
+    with _data_lock:
+        store = load_integrations()
+        if existing is not None:
+            existing = stored_secret(store, c, spec) or {}  # as stored now, not as it was before the check
+        store["keys"][c.name] = {**existing, **secret} if existing is not None else secret
+        store["dismissed"] = [n for n in store["dismissed"] if n != c.name]
+        save_integrations(store)
     kept = f" ({', '.join(sorted(secret))})" if existing is not None else ""
     activity.log("info", "integrations", f"{spec['id']} credentials for {c.name} tested and stored{kept}")
     return jsonify({"error": None})
@@ -1514,9 +1681,10 @@ def integration_key(name):
     if err:
         return err
     if request.method == "DELETE":
-        store = load_integrations()
-        store["keys"].pop(c.name, None)
-        save_integrations(store)
+        with _data_lock:
+            store = load_integrations()
+            store["keys"].pop(c.name, None)
+            save_integrations(store)
         activity.log("info", "integrations", f"credentials for {c.name} removed")
         return jsonify({"error": None})
     body = request.get_json(silent=True)
@@ -1546,15 +1714,16 @@ def integration_dismiss(name, action):
     c, spec, err = _integration_target(name, write=False)
     if err:
         return err
-    store = load_integrations()
-    if action == "dismiss":
-        if c.name in store["keys"]:
-            return jsonify({"error": "remove the key first"}), 400
-        if c.name not in store["dismissed"]:
-            store["dismissed"].append(c.name)
-    else:
-        store["dismissed"] = [n for n in store["dismissed"] if n != c.name]
-    save_integrations(store)
+    with _data_lock:
+        store = load_integrations()
+        if action == "dismiss":
+            if c.name in store["keys"]:
+                return jsonify({"error": "remove the key first"}), 400
+            if c.name not in store["dismissed"]:
+                store["dismissed"].append(c.name)
+        else:
+            store["dismissed"] = [n for n in store["dismissed"] if n != c.name]
+        save_integrations(store)
     return jsonify({"error": None})
 
 

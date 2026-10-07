@@ -15,7 +15,10 @@
       <button class="btn" id="toggle-all" type="button">Collapse all</button>
       <button class="btn" id="edit-layout" type="button" aria-pressed="false">Customize</button>
       <button class="btn icon-btn" id="settings-btn" type="button" aria-label="Settings" aria-haspopup="dialog" title="Settings"></button>
-      <a class="logout" href="{{ url_for('logout') }}">Log out ({{ user }})</a>
+      <form class="logout-form" method="post" action="{{ url_for('logout') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="logout" type="submit">Log out ({{ user }})</button>
+      </form>
     </div>
   </header>
 
@@ -53,7 +56,7 @@
       <button class="mini" id="settings-close" type="button">Close</button>
     </div>
     <div class="cfg-body">
-      <p class="hint">These apply to this browser only.</p>
+      <p class="hint">These apply to this browser only. Ratatosk {{ version }}.</p>
       <h3 class="cfg-section">Display</h3>
       <label class="set-field" for="max-columns"><span>Columns<small>Narrow windows still show fewer.</small></span>
         <select id="max-columns">
@@ -83,13 +86,13 @@
       <div id="account-box"></div>
       {% if role == "admin" %}
       <h3 class="cfg-section">Users</h3>
-      <p class="hint">Admins manage users and app keys. Operators can start, stop and restart containers, update them and arrange their own page.</p>
+      <p class="hint">Admins manage users and app keys, update containers and read the Debug log. Operators can start, stop and restart containers, edit game servers' config files and arrange their own page.</p>
       <div id="users-box"></div>
       {% endif %}
     </div>
   </dialog>
 
-  <div class="welcome" id="welcome" role="alertdialog" aria-live="polite" aria-labelledby="welcome-title" aria-describedby="welcome-text"{% if not welcome %} hidden{% endif %}>
+  <div class="welcome" id="welcome" role="alertdialog" aria-modal="true" aria-live="polite" aria-labelledby="welcome-title" aria-describedby="welcome-text"{% if not welcome %} hidden{% endif %}>
     <div class="welcome-card">
       <div class="spinner" id="welcome-spinner" aria-hidden="true"></div>
       <h2 id="welcome-title">Searching for containers…</h2>
@@ -101,13 +104,14 @@
     </div>
   </div>
 
-  <p class="error" id="error" hidden></p>
+  <p class="error" id="error" role="alert" hidden></p>
   <div class="notices" id="notices" hidden></div>
 
   <main class="board" id="board" aria-label="Panels"></main>
   <div class="new-zone" id="new-zone">Drop a container here to start a new group</div>
 </div>
 <script src="{{ url_for('static', filename='layout.js') }}"></script>
+<script src="{{ url_for('static', filename='editlogic.js') }}"></script>
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 <script src="{{ url_for('static', filename='users.js') }}"></script>
 {% endblock %}

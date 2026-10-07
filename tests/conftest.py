@@ -3,7 +3,6 @@ import io
 import os
 import sys
 import tarfile
-import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -69,6 +68,12 @@ class FakeClient:
         self.registry = {}
         self.images = SimpleNamespace(get_registry_data=self._registry_data)
         self.containers = SimpleNamespace(get=self._get, list=lambda all=False: list(self.by_name.values()))
+        self.ping_error = None  # set to an exception to make the daemon look unreachable
+
+    def ping(self):
+        if self.ping_error:
+            raise self.ping_error
+        return True
 
     def add(self, c):
         self.by_name[c.name] = c
@@ -88,15 +93,17 @@ class FakeClient:
 
 
 @pytest.fixture
-def env(monkeypatch):
-    """Fresh app module per test: temp data dir, no sampler thread, fake Docker."""
+def env(monkeypatch, tmp_path):
+    """Fresh app module per test: temp data dir, no sampler thread, fake Docker. The settings
+    the app reads from the environment are cleared first, so a developer's own don't leak in."""
     import docker
 
-    data = tempfile.mkdtemp()
+    data = str(tmp_path)
     monkeypatch.setenv("DATA_DIR", data)
     monkeypatch.setenv("DISABLE_SAMPLER", "1")
     monkeypatch.setenv("HOSTNAME", "dashboardself")
-    monkeypatch.delenv("READ_ONLY", raising=False)
+    for name in ("READ_ONLY", "BEHIND_PROXY", "UPDATE_CHECK", "PROXY_IP_HEADER"):
+        monkeypatch.delenv(name, raising=False)
     client = FakeClient()
     monkeypatch.setattr(docker, "from_env", lambda: client)
     sys.modules.pop("app", None)
@@ -105,13 +112,25 @@ def env(monkeypatch):
     return SimpleNamespace(app=module, client=client, data=data)
 
 
+def form_csrf(client, path="/login", **kw):
+    """The hidden token the login and setup forms carry (fetched the way a browser would)."""
+    client.get(path, **kw)
+    with client.session_transaction(**kw) as s:
+        return s["csrf_pre"]
+
+
+def post_login(client, username, password, **kw):
+    """Sign in the way the form does: with the token its page carried."""
+    return client.post("/login", data={"username": username, "password": password, "csrf_token": form_csrf(client)}, **kw)
+
+
 @pytest.fixture
 def logged_in(env):
     """A test client with the admin created and signed in; returns (client, csrf)."""
     c = env.app.app.test_client()
     r = c.post(
         "/setup",
-        data={"token": env.app.setup_token, "username": "admin", "password": "correct-horse"},
+        data={"token": env.app.setup_token, "username": "admin", "password": "correct-horse", "csrf_token": form_csrf(c, "/setup")},
     )
     assert r.status_code == 302
     with c.session_transaction() as s:

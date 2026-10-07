@@ -17,8 +17,8 @@ venv/
 .coverage
 htmlcov/
 *.egg-info/
-build/
-dist/
+/build/
+/dist/
 
 # Node (only used for quick frontend checks)
 node_modules/
@@ -30,7 +30,7 @@ node_modules/
 *.env
 *.pem
 *.key
-data/
+/data/
 *.log
 
 # Own compose files, the example one stays
@@ -48,3 +48,6 @@ docker-compose.override.yml
 .DS_Store
 .directory
 Thumbs.db
+
+# Private research notes, not for the public repo
+docs-private/

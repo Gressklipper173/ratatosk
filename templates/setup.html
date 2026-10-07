@@ -6,6 +6,7 @@
   <p class="hint">Create the admin account. The setup token is printed in the container logs (<code>docker logs &lt;container&gt;</code>).</p>
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
   <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label>Setup token <input name="token" autocomplete="off" autofocus required></label>
     <label>Username <input name="username" autocomplete="username" required></label>
     <label>Password (8+ characters) <input name="password" type="password" autocomplete="new-password" minlength="8" required></label>

@@ -1,9 +1,16 @@
 # Adapters
 
 An adapter tells Ratatosk how to read data from one app, such as the list of missing
-episodes in Sonarr. It is a small YAML file. It holds no code: the only thing an adapter can make
-Ratatosk do is send `GET` requests to paths on that app's own API, using a key an admin
-approved.
+episodes in Sonarr. It is a small YAML file. It holds no code: the requests an adapter makes are
+`GET` requests to paths on that app's own API, using a key an admin approved. The one other
+thing it can do is name a file in the container to read a key from, see below.
+
+**Trust:** `/data/adapters` is admin-trust. Whoever can write files there decides what Ratatosk
+does with the keys it holds, so treat it like the Docker socket. The sensitive field is
+`key_file`: when an admin presses **Find key automatically**, Ratatosk reads the file `key_file.path`
+names (any absolute path) inside the matching container, so an adapter can point it at any file the
+container can read. What it reads is limited to the pattern's one match (or one JSON value), which is sent
+to that container as the key and stored, but only install adapters you have read.
 
 Adapters are optional. Without one, every container still gets state, logs, stats and
 start/stop/restart.
@@ -21,8 +28,8 @@ start/stop/restart.
    - **Dismiss**: hide the panel. **Restore dismissed integrations** in **Settings** (the cog in the page header) brings it back.
 3. With a key stored, the app gets a panel with its data. **Remove key** (in **Customize**) goes back to step 1.
 
-The key is stored in `/data/integrations.json` (readable only by Ratatosk's user). It is
-not encrypted, because Ratatosk would have to keep the encryption key in the same volume.
+The key is stored in `/data/integrations.json` (mode 0600, which does not hold back root, and Ratatosk
+runs as root). It is not encrypted, because Ratatosk would have to keep the encryption key in the same volume.
 Only admins can find, enter or remove keys; operators see the panels but not these buttons. It is never sent to the browser or written to the logs. In `READ_ONLY` mode, finding, saving and
 removing keys are switched off.
 
@@ -51,6 +58,7 @@ request returns the list you want. The app's API documentation or its browser de
 
 If a file has a mistake, Ratatosk skips only that file and lists the problem in a red
 "Adapter problems" line above the groups and in the container logs. Other adapters keep working.
+That also covers a file that is not valid UTF-8 and one over 64 KB.
 
 A file in `/data/adapters` whose `id` matches a built-in adapter replaces it, which is how you
 change a built-in's behaviour.
@@ -59,7 +67,7 @@ change a built-in's behaviour.
 
 | Field | Required | Meaning |
 |-------|----------|---------|
-| `id` | yes | Short name: lowercase letters, digits, `-` or `_`, up to 32 characters. Used by the `dashboard.adapter` label. |
+| `id` | yes | Short name: lowercase letters, digits, `-` or `_`, up to 32 characters. Used by the `ratatosk.adapter` label. |
 | `name` | yes | Name shown on the panel. |
 | `match.images` | yes | List of image names. A container matches when the last part of its image name (`lscr.io/linuxserver/sonarr:latest` becomes `sonarr`) is in the list. An entry with a slash names the repository instead: `pelican/panel` matches `ghcr.io/pelican/panel:latest` but not `ghcr.io/other/panel`. Use it when the last part is too common on its own. |
 | `match.port` | yes | The port the app listens on **inside** its container. |
@@ -67,8 +75,8 @@ change a built-in's behaviour.
 | `auth.keys` | with `keys` auth | One to four `{id, label, sufficient}` entries (`sufficient`, default false, marks a key that alone gives a working panel, so the page stops listing the other keys as not set). Each is optional; at least one must be entered. The handler receives `{id: key}` for the ones that are stored. |
 | `auth.header` | with `header` auth | The HTTP header the key is sent in, for example `X-Api-Key`. The key is sent exactly as stored, so apps that want `Bearer <key>` are not supported by this format yet (see Limits). |
 | `test_path` | yes (without a handler) | Path requested to check a key before it is stored. Must start with `/`. |
-| `key_file.path` | no | File inside the container that holds the key. Without `key_file`, the panel has no "Find key automatically" button. |
-| `key_file.regex` | one of these two | Pattern with exactly one capture group around the key, for example `<ApiKey>([^<]+)</ApiKey>`. Good for XML and plain text. |
+| `key_file.path` | no | File inside the container that holds the key. Without `key_file`, the panel has no "Find key automatically" button. **Sensitive:** this can be any absolute path in the matching container, so read adapters from others before installing them. The path must name a file, and only that file is used. |
+| `key_file.regex` | one of these two | Pattern with exactly one capture group around the key, for example `<ApiKey>([^<]+)</ApiKey>`. Good for XML and plain text. Only the first 64 KB of the file is searched, and a pattern that repeats a repeated group, like `(a+)+`, is rejected. |
 | `key_file.json_path` | one of these two | Dotted path to the key in a JSON file, for example `main.apiKey`. Use it when the file holds several `apiKey` fields. |
 | `handler` | no | Name of a Python handler. **Only adapters shipped with Ratatosk can use it.** |
 | `panels` | yes (without a handler) | One to ten panels (below). |
@@ -86,17 +94,21 @@ Each panel:
 | `row_detail` | no | Smaller text on the right of each row, same `{field}` syntax. |
 | `total` | no | Where the total count is in the answer, shown next to the title. Defaults to the number of rows returned. |
 
-At most 50 rows are shown per panel. Paths can't contain `..` or a host name: requests always go
-to the container itself.
+At most 50 rows are shown per panel. Paths can't contain `..`, a host name, spaces or control
+characters: requests always go to the container itself. Redirects are not followed: an answer that
+redirects is treated as an error, and the key is never sent to the new address. Requests also ignore
+any proxy set in Ratatosk's environment, and a slow or oversized answer (over 4 MB) is cut off.
 
-## The `dashboard.adapter` label
+## The `ratatosk.adapter` label
 
 Add a Docker label to a container to override matching:
 
 | Label | Effect |
 |-------|--------|
-| `dashboard.adapter=<id>` | Use that adapter whatever the image is called (handy for custom builds). |
-| `dashboard.adapter=none` | Never show a panel for this container. |
+| `ratatosk.adapter=<id>` | Use that adapter whatever the image is called (handy for custom builds). |
+| `ratatosk.adapter=none` | Never show a panel for this container. |
+
+The older `dashboard.adapter` label still works; if both are set, `ratatosk.adapter` wins.
 
 ## How Ratatosk reaches the app
 

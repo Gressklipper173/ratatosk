@@ -40,7 +40,8 @@ From nothing to a working page, in order.
 - `git`, to download the code.
 - Internet access for the first build (it pulls the Python base image and Docker's own CLI image).
 - Port 8090 free on the host (or choose another in step 3).
-- A browser that can reach the host. Keep Ratatosk on a private network, see [Security](#security).
+- A browser on the host itself, or one that can reach it once you open the port up (step 3). Keep
+  Ratatosk on a private network, see [Security](#security).
 
 ### 1. Download
 
@@ -61,7 +62,11 @@ cp docker-compose.example.yml docker-compose.yml
 
 Open `docker-compose.yml`. The defaults work as they are. The usual changes are:
 
-- **The port.** `"8090:8090"`: change the left number to serve on another port.
+- **The port and who can reach it.** The example publishes `"127.0.0.1:8090:8090"`, so the page opens
+  only from the host itself. To reach it from other devices on your network, change it to
+  `"8090:8090"` (every interface) or put the host's LAN or VPN address in front, for example
+  `"192.168.1.10:8090:8090"`. Docker's published ports bypass the host firewall (UFW, firewalld), so do
+  that only on a private network. Change the left port number to serve on another port.
 - **Read-only mode.** Set `READ_ONLY: "true"` if Ratatosk should only look (see [Configuration](#configuration)).
 - **Extra mounts**, only if you want the Update button or the storage meters to see more of the host.
   The file has commented examples, and the sections [Updates](#updates) and
@@ -90,7 +95,7 @@ time Ratatosk starts while no admin exists, so if you lose it, `docker restart r
 ### 6. Create the admin account
 
 Open `http://<host>:8090/setup`, where `<host>` is the name or address of the machine (use `localhost` if
-you are on it). Enter the token, a username (letters, digits, `.`, `_` and `-`, up to 32 characters) and a
+you are on it, which is the only way in until you open the port up in step 3). Enter the token, a username (letters, digits, `.`, `_` and `-`, up to 32 characters) and a
 password of at least 8 characters, then press **Create admin**. You are signed in. From now on
 `http://<host>:8090` shows the sign-in page.
 
@@ -147,7 +152,9 @@ its real name first:
 docker volume ls --filter name=ratatosk-data
 ```
 
-It is usually `ratatosk_ratatosk-data` (the folder name, then the volume name). Back it up
+It is usually `ratatosk_ratatosk-data` (the folder name, then the volume name). The image itself
+declares `VOLUME /data`, so a bare `docker run` without `-v` keeps the data in an anonymous volume
+that is easy to lose; the compose file names it. Back it up
 (replace `VOLUME` with the name from above):
 
 ```
@@ -182,7 +189,9 @@ Then remove the folder if you like.
 ## Troubleshooting
 
 - **The page doesn't open.** Check `docker compose ps` and `docker logs ratatosk`. If the port is taken,
-  change the left number in `ports:` and run `docker compose up -d`. Check the host's firewall.
+  change the left number in `ports:` and run `docker compose up -d`. The example file publishes the
+  port on `127.0.0.1` only, so another device needs the `ports:` line opened up (step 3 of the quick
+  start), and then the host's firewall may matter.
 - **I lost the setup token.** Run `docker restart ratatosk` and read the log again (step 5). A token is
   only made while no admin exists.
 - **I forgot my password.** Another admin can reset it under **Settings → Users**. If you are the only
@@ -192,7 +201,7 @@ Then remove the folder if you like.
   `docker restart ratatosk`. Behind a reverse proxy see `BEHIND_PROXY` in [Security](#security).
 - **The container list is empty or shows a Docker error.** Ratatosk needs `/var/run/docker.sock`
   mounted. On a host with SELinux, if it still can't read the socket, add
-  `security_opt: ["label=disable"]` to the service.
+  `label=disable` to the service's `security_opt:` list (the example file already has one).
 - **The page looks old after an update.** Hard refresh (Ctrl+Shift+R).
 - **The Update button is greyed out.** Mount the project's folder at the same path (see [Updates](#updates)).
 - **An app's panel says it could not reach the app, or shows nothing.** See [Integrations](#integrations);
@@ -204,11 +213,14 @@ Set these under `environment:` in your compose file.
 
 | Variable    | Default | Meaning                                  |
 |-------------|---------|------------------------------------------|
-| `READ_ONLY` | off     | Disable start/stop/restart/update/delete, app keys and user changes |
+| `READ_ONLY` | off     | Disable start/stop/restart/update/delete, app keys, game-server config files and user changes. Layouts, dismissing apps, the Debug detail level and your own password stay available |
 | `UPDATE_CHECK` | on   | Set `false` to stop asking registries about newer images |
-| `BEHIND_PROXY` | off  | Set `true` when a reverse proxy or tunnel is the only way in: the login throttle and the Debug log then use the visitor's real address |
+| `BEHIND_PROXY` | off  | Set `true` when a reverse proxy or tunnel is the only way in: the login throttle and the Debug log then use the visitor's real address, and the `Secure` cookie flag follows `X-Forwarded-Proto` |
+| `PROXY_IP_HEADER` | `xff` | With `BEHIND_PROXY`: where the visitor's address comes from. `xff` is the last `X-Forwarded-For` entry, which is the address your proxy appended (check that yours does). `cf` is Cloudflare's `CF-Connecting-IP`; **Cloudflare users must set `cf`**, since the last `X-Forwarded-For` entry is not reliably the visitor there. Only the chosen header is read, so your proxy must set or overwrite it and not pass the visitor's copy through. Any other value is treated as `xff` |
 | `DATA_DIR`  | `/data` | Where users, keys, layouts and the session key are kept. Leave it and mount a volume there |
-| `DOCKER_HOST` | the socket | Point at a filtered socket proxy instead of mounting the socket directly |
+| `DOCKER_HOST` | the socket | Where the Docker API is, if not the mounted socket (see [Security](#security) before using a socket proxy) |
+| `HOSTNAME` | set by Docker | Docker sets it to the container's short id, and Ratatosk uses it to recognise its own container (so it never offers to stop itself). Don't override it; see `hostname:` in [Quick start](#3-adjust-it-optional) |
+| `DISABLE_SAMPLER` | off | Set to `1` to run without the background threads (stats sampler, update checker) and refresh Pelican data inline. Meant for the test suite, not for normal use |
 
 Ratatosk listens on port 8090 inside the container; change the left number of `ports:` to serve on another
 port. Everything it stores is in `DATA_DIR`:
@@ -216,7 +228,7 @@ port. Everything it stores is in `DATA_DIR`:
 | File | Holds |
 |------|-------|
 | `users.json` | Accounts (password hashes) and roles |
-| `integrations.json` | App keys and logins you entered (readable only by Ratatosk's user, not encrypted) |
+| `integrations.json` | App keys and logins you entered (mode 0600, not encrypted; Ratatosk runs as root, so the mode does not keep other root processes or anyone with Docker access out) |
 | `groups/` | One file per user: layout, groups, names, priorities, storage meters |
 | `secret_key` | Signs the session cookies |
 | `adapters/` | Your own app adapters, if you mount some |
@@ -226,19 +238,48 @@ port. Everything it stores is in `DATA_DIR`:
 - Mounting `/var/run/docker.sock` gives Ratatosk (and anyone who logs in to
   it) root-equivalent control of the host. **Do not expose it to the public
   internet.** Put it behind a VPN such as Tailscale or WireGuard.
-- Set `READ_ONLY=true` to disable all state-changing actions.
-- To reduce the socket's reach, point `DOCKER_HOST` at a filtered socket proxy
-  instead of mounting the socket directly.
+- The example compose file publishes the port on `127.0.0.1` only. Opening it to other devices
+  is your choice; Docker's published ports bypass the host firewall.
+- Set `READ_ONLY=true` to disable the actions that change containers, app keys, game-server config
+  files and users. Saving your layout, dismissing and restoring app notices, the Debug detail level
+  and changing your own password stay allowed, because they change only what is displayed or your
+  own account.
+- A socket proxy gives little protection here. Ratatosk needs to start, stop and delete containers,
+  read logs, stats and files (archive reads), look up registries, and run `docker compose pull` and
+  `up -d`. A proxy that lets those container POST calls through generally lets `containers/create`
+  through too, and creating a privileged container is a way to take over the host. `DOCKER_HOST`
+  still works if you want to point Ratatosk at a Docker API elsewhere, but don't count on a proxy
+  to make it safe.
+- Ratatosk runs as root inside its container (it needs the socket), so file modes such as 0600 on
+  its data do not protect anything from root. The example compose file sets
+  `no-new-privileges`, which is a small extra guard, not a sandbox.
 - Behind a reverse proxy or tunnel, set `BEHIND_PROXY=true` and make sure nothing else can reach
   Ratatosk's port, because the address then comes from a header. Without it every visitor
-  looks like the proxy, so five failed logins by anyone lock everyone out. The session cookie is
-  marked `Secure` whenever the page was served over https, whatever the setting. Ratatosk
+  looks like the proxy, so five failed logins by anyone lock everyone out. Set `PROXY_IP_HEADER` to
+  the header your proxy overwrites: `xff` (default) for most proxies, `cf` for Cloudflare. If the
+  proxy passes the visitor's own copy of that header through, anyone can forge their address and
+  get past the login throttle. The session cookie is marked `Secure` when Ratatosk
+  sees the request as https: a direct https connection, or, with `BEHIND_PROXY=true`, a proxy that
+  sends `X-Forwarded-Proto: https`. A proxy that ends TLS and forwards plain http *without*
+  `BEHIND_PROXY` leaves the cookie without `Secure`. Ratatosk
   is meant for a private network. If you publish it, put an access layer with MFA in front of it
   (for example Cloudflare Access); its own sign-in has no second factor.
 - Container logs can contain secrets. They are only shown to signed-in users,
   and stay visible in `READ_ONLY` mode.
 - Logins are throttled per IP (changing your own password counts too), and first-run setup
-  requires a token that is only printed to the container logs.
+  requires a token that is only printed to the container logs. The sign-in and setup forms carry a
+  CSRF token, and signing out is a POST with one.
+- A sign-in lasts 12 hours from your last request. A page left open keeps itself signed in; an
+  idle browser is signed out.
+- Every page and API answer carries a Content-Security-Policy (scripts and styles only from
+  Ratatosk itself, no framing), `X-Frame-Options: DENY` and `X-Content-Type-Options: nosniff`, and the
+  pages and API answers are marked `no-store`.
+- If `users.json` is damaged (not valid JSON, or not an object), Ratatosk refuses to start instead of
+  treating it as empty, which would re-open the setup page to anyone who reaches it. If it
+  breaks while running, requests answer 503 and the Debug panel and container logs name the file.
+  Restore it from a backup. (A missing file is the normal first-run state.)
+- `GET /healthz` needs no sign-in. Once an account exists it also asks Docker, and answers 503 when
+  the socket is missing or unusable, so the Docker healthcheck shows the problem.
 - Roles limit who can change app keys and users, see [Users](#users).
 
 ## Debug
@@ -255,8 +296,8 @@ half a megabyte), and a restart clears it. Repeated lines are counted instead of
 - Keys, passwords, request bodies and reply bodies are never recorded, and neither is the
   query string of a request. Anything stored as a credential is also masked if it ever
   turns up in a message.
-- Every signed-in user can open it, also in `READ_ONLY` mode. Lines can contain container
-  names and addresses.
+- Only admins can open it or change its detail level (operators don't see the button), also in
+  `READ_ONLY` mode. Lines can contain container names and addresses.
 - The same lines go to the container's own output (`docker logs`). Docker keeps that without
   limit unless you tell it otherwise, so `docker-compose.example.yml` sets
   `max-size: 10m` and `max-file: 3`. Keep those lines in your own compose file.
@@ -307,16 +348,21 @@ give it a name such as *Home*, and press **Add**. Add as many as you like; **Ren
 shows the same disks. Until you add one, the panel shows Ratatosk's own disk, which is the one
 Docker keeps its storage on.
 
-A container can't see the host's disks by itself, so the picker lists what has been mounted into
-it. To show a disk that isn't listed, mount any folder from it into Ratatosk, read-only is
-fine (only the disk's size and free space are read, never the folder's contents):
+A container can't see the host's disks by itself, so the picker lists only what has been mounted
+into it. By default that is the small disk Docker keeps Ratatosk's own data on, **not** your big
+data disks. To show another disk, mount any folder that lives on it into Ratatosk, read-only is
+fine (only the disk's size and free space are read, never the folder's contents). Find the disk
+with `df -h` on the host: the **Mounted on** column is the folder to use. For a disk mounted at
+`/home`, for example:
 
 ```yaml
 volumes:
-  - /srv/data:/host/data:ro
+  - /home:/host/home:ro
 ```
 
-Recreate Ratatosk (`docker compose up -d`), then **Add disk** lists it. If the Compose
+Add the line under the `volumes:` of the `ratatosk` service, then recreate Ratatosk with
+`docker compose up -d` (no `down` needed; your data volume is kept). **Add disk** then lists
+it, with its real size. If the Compose
 project folders you mounted for the Update button sit on another disk, that disk is already
 listed.
 
@@ -327,15 +373,16 @@ only admins see it. There are two roles:
 
 | Role | Can do |
 |------|--------|
-| Admin | Everything an operator can, plus add, remove and change users, reset passwords, and find, enter or remove app keys |
-| Operator | Look at everything, start, stop, restart and update containers, edit the config files of game servers, and arrange their own page. Cannot manage users or app keys |
+| Admin | Everything an operator can, plus add, remove and change users, reset passwords, find, enter or remove app keys, update and delete containers, and use the Debug panel |
+| Operator | Look at everything except the Debug log, start, stop and restart containers, edit the config files of game servers, and arrange their own page. Cannot manage users or app keys, update or delete containers, or open Debug |
 
 - **Passwords:** an admin sets a password when adding a user and can reset it later. There is no
   email, so a forgotten password is reset by an admin. Everyone can change their own under
   **Settings** → **Account**. Passwords are at least 8 characters and stored hashed.
 - **The last admin** can't be removed or made an operator.
 - **Role changes and removals apply at once**, also to a person who is signed in.
-  A password change does not sign out sessions that are already open.
+  Changing or resetting a password signs that account out everywhere else; the device that changed it
+  stays signed in. A session also ends after 12 hours without a request.
 - **Layout and groups are per user:** panels, groups, display names, link tiles and storage
   meters belong to the account. A user who hasn't saved anything yet starts from the shared
   `groups.json` of earlier versions, so an existing page doesn't change; their first change
@@ -396,9 +443,13 @@ Container labels override the guess:
 
 | Label                | Effect                                                     |
 |----------------------|------------------------------------------------------------|
-| `dashboard.name`     | Name shown for the container (a rename in the UI wins)     |
-| `dashboard.url`      | Link to this `http(s)` URL instead of the published port   |
-| `dashboard.hide`     | `true` removes the tile                                    |
+| `ratatosk.name`      | Name shown for the container (a rename in the UI wins)     |
+| `ratatosk.url`       | Link to this `http(s)` URL instead of the published port   |
+| `ratatosk.hide`      | `true` removes the tile                                    |
+| `ratatosk.adapter`   | An app adapter id to use whatever the image is called, or `none` to hide the app's panel (see [Integrations](#integrations)) |
+
+The older `dashboard.name`, `dashboard.url`, `dashboard.hide` and `dashboard.adapter` still work;
+if both are set, the `ratatosk.` one wins.
 
 ## Updates
 
@@ -440,8 +491,8 @@ and removing keys.
 | qBittorrent | Active downloads, with progress and speeds | Username and password, entered by hand (qBittorrent stores the password hashed, so it can't be looked up) |
 | Pelican (panel) | Game servers with their real names, ports and live state; start, stop and restart through the panel | Up to two API keys (admin and user), entered by hand, each optional (see [Pelican](#pelican)) |
 
-The panel for each app matches by image name. Set the label `dashboard.adapter=<id>` on a container
-to match an app with a custom image name, or `dashboard.adapter=none` to hide its panel.
+The panel for each app matches by image name. Set the label `ratatosk.adapter=<id>` on a container
+to match an app with a custom image name, or `ratatosk.adapter=none` to hide its panel.
 
 ### Setup
 
@@ -475,7 +526,8 @@ password instead of a key shows **Enter login**; use the credentials of its web 
 Some apps need a setting of their own before they accept Ratatosk. For example, if qBittorrent
 says the address was refused, check Tools > Options > Web UI: turn off "Enable Host header
 validation", or add the name Ratatosk uses. Too many failed logins can also temporarily ban
-Ratatosk's address.
+Ratatosk's address, so after a wrong password Ratatosk stops trying that login for about five
+minutes (enter the right one, and it logs in again at once).
 
 ### Pelican
 
@@ -500,7 +552,9 @@ one is optional and switches on its own part:
 With only the user key, the list is that account's own servers. With only the admin key there
 is no live state, and Start/Stop/Restart still go straight to Docker (the Debug panel notes it
 each time). Add the other key later with **Add** on the panel. **Remove keys** (in **Customize**) forgets both. The panel is matched by the image `pelican/panel`; set the label
-`dashboard.adapter=pelican` for a custom image. One Pelican panel per Ratatosk is supported.
+`ratatosk.adapter=pelican` for a custom image. **One Pelican panel per Ratatosk is supported:** the
+shared cache of server names and states holds a single Pelican, so with two the rows would fight
+over it and show the wrong names, and **Remove keys** forgets both.
 
 **Editing config files.** With the user key set, a stopped server's row has a **Config** button.
 It opens a dialog listing the server's settings files (`.ini`, `.cfg`, `.properties`, `.txt`;
@@ -524,14 +578,14 @@ with no code. See [docs/ADAPTERS.md](docs/ADAPTERS.md) for the format and a step
 Put your files in a folder and mount it into Ratatosk, for example
 `./my-adapters:/data/adapters:ro`, then restart Ratatosk.
 
-## Development
+## Development (see also [CONTRIBUTING.md](CONTRIBUTING.md))
 
 ```
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 python -m pytest -q
 node --test tests/js/*.mjs     # the panel layout logic, no browser needed
-node --check static/app.js     # syntax check of the page script
+for f in static/*.js; do node --check "$f"; done   # syntax check of the page scripts
 ```
 
 The tests use a fake Docker client, so they need no Docker daemon. The image uses Python 3.12.

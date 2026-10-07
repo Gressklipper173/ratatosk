@@ -8,8 +8,7 @@
 
   async function call(url, method, body) {
     try {
-      const res = await api(url, { method, headers: { "X-CSRF-Token": csrf, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
-      return res;
+      return await api(url, { method, body: body ? JSON.stringify(body) : undefined });
     } catch (e) {
       return { error: String(e) };
     }
@@ -25,13 +24,18 @@
     return input;
   }
 
-  function status(box) {
+  function status() {
     const p = el("p", "int-note");
-    p.setAttribute("role", "status");
     p.hidden = true;
     return {
       node: p,
-      show(text, bad) { p.hidden = !text; p.textContent = text || ""; p.classList.toggle("bad", !!bad); },
+      // a failure is announced at once, anything else politely
+      show(text, bad) {
+        p.hidden = !text;
+        p.textContent = text || "";
+        p.classList.toggle("bad", !!bad);
+        p.setAttribute("role", bad ? "alert" : "status");
+      },
     };
   }
 
@@ -87,6 +91,7 @@
     const reset = el("button", "mini", "Reset password");
     reset.type = "button";
     reset.addEventListener("click", () => {
+      row.querySelector("form")?.remove(); // pressing the button again replaces the form
       const pw = field("password", `New password for ${u.name}`, "new-password");
       const ok = el("button", "mini primary", "Save");
       ok.type = "submit";
@@ -100,7 +105,7 @@
         msg.show(res.error || `Password of ${u.name} reset.`, !!res.error);
         if (!res.error) f.remove();
       });
-      row.after(f);
+      row.append(f);
       pw.focus();
     });
     const remove = el("button", "mini", "Remove");

@@ -72,6 +72,12 @@ def test_label_picks_an_adapter_for_any_image(env, logged_in):
     assert items(c)[0]["adapter"] == "sonarr"
 
 
+def test_ratatosk_adapter_label_wins_over_the_older_one(env, logged_in):
+    c, _ = logged_in
+    add_sonarr(env, image_ref="my-custom-build", labels={"ratatosk.adapter": "sonarr", "dashboard.adapter": "none"})
+    assert items(c)[0]["adapter"] == "sonarr"
+
+
 def test_label_none_switches_the_notice_off(env, logged_in):
     c, _ = logged_in
     add_sonarr(env, labels={"dashboard.adapter": "none"})
@@ -492,10 +498,10 @@ import handlers  # noqa: E402
 @pytest.fixture(autouse=True)
 def clean_handler_state():
     handlers._titles.clear()
-    handlers._sessions.clear()
+    handlers.forget_sessions()
     yield
     handlers._titles.clear()
-    handlers._sessions.clear()
+    handlers.forget_sessions()
 
 
 def add_app(env, name, image, files=None, labels=None, status="running"):
@@ -886,7 +892,7 @@ def test_json_path_key_extraction_picks_the_named_field():
             tar.addfile(info, io.BytesIO(text.encode()))
         return [buf.getvalue()]
 
-    kf = {"path": "/x", "json_path": "main.apiKey"}
+    kf = {"path": "/settings.json", "json_path": "main.apiKey"}
     assert integrations.key_from_archive(archive(SEERR_SETTINGS), kf) == "goodkey123"
     assert integrations.key_from_archive(archive("{not json"), kf) is None
     assert integrations.key_from_archive(archive('{"main": {"apiKey": 5}}'), kf) is None
@@ -922,3 +928,356 @@ def test_panel_cache_follows_the_age_the_page_asks_for(env, logged_in, fake_app)
 def test_age_is_clamped(env, value, expected):
     with env.app.app.test_request_context(f"/?age={value}"):
         assert env.app.age_arg(30, 5, 300) == expected
+
+
+# ---- one HTTP layer: redirects, malformed answers, slow answers -------------------
+
+import http.server  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+
+
+@pytest.fixture
+def two_servers():
+    """A real server that redirects everything, and one that records what reaches it."""
+    landed = []
+
+    class Target(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            landed.append(dict(self.headers))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"leaked": true}')
+
+        def log_message(self, *a):
+            pass
+
+    target = http.server.HTTPServer(("127.0.0.1", 0), Target)
+
+    class Redirect(Target):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{target.server_port}/steal")
+            self.end_headers()
+
+        do_POST = do_GET
+
+    redirect = http.server.HTTPServer(("127.0.0.1", 0), Redirect)
+    for srv in (target, redirect):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{redirect.server_port}", landed
+    for srv in (target, redirect):
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_a_redirect_from_an_app_is_an_error_and_the_key_is_not_sent_on(two_servers):
+    base, landed = two_servers
+    with pytest.raises(integrations.AppError, match="HTTP 302"):
+        integrations.http_get_json(base + "/api/x", "X-Api-Key", "SECRETKEY")
+    assert landed == []
+
+
+def test_a_redirect_is_not_followed_for_handler_requests_either(two_servers):
+    import urllib.request
+
+    base, landed = two_servers
+    req = urllib.request.Request(base + "/api", headers={"Authorization": "Bearer SECRETKEY"})
+    assert handlers._send(integrations.make_opener(), req) == (302, b"")
+    assert landed == []
+
+
+def test_environment_proxies_are_never_used(monkeypatch, two_servers):
+    base, landed = two_servers
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")  # nothing listens: a proxied request would fail
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    with pytest.raises(integrations.AppError, match="HTTP 302"):
+        integrations.http_get_json(base + "/api/x", "X-Api-Key", "k")
+
+
+class DripResponse:
+    status = 200
+
+    def read(self, n=-1):
+        time.sleep(0.02)
+        return b" "
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class OpenerOf:
+    def __init__(self, fn):
+        self.fn = fn
+
+    def open(self, req, timeout=None):
+        return self.fn(req)
+
+
+def test_an_answer_that_drips_in_hits_the_total_deadline(monkeypatch):
+    monkeypatch.setattr(integrations, "REQUEST_DEADLINE", 0.2)
+    monkeypatch.setattr(integrations, "make_opener", lambda *extra: OpenerOf(lambda req: DripResponse()))
+    start = time.monotonic()
+    with pytest.raises(integrations.AppError, match="took too long"):
+        integrations.http_get_json("http://10.0.0.2:8989/x", "X-Api-Key", "k")
+    assert time.monotonic() - start < 2
+
+
+def test_an_answer_over_the_size_cap_is_refused_while_reading(monkeypatch):
+    class Endless(DripResponse):
+        def read(self, n=-1):
+            return b"x" * 65536
+
+    monkeypatch.setattr(integrations, "MAX_RESPONSE", 200_000)
+    monkeypatch.setattr(integrations, "make_opener", lambda *extra: OpenerOf(lambda req: Endless()))
+    with pytest.raises(integrations.AppError, match="too large"):
+        integrations.http_get_json("http://10.0.0.2:8989/x", "X-Api-Key", "k")
+    with pytest.raises(integrations.AppError, match="too large"):
+        handlers._send(OpenerOf(lambda req: Endless()), __import__("urllib.request").request.Request("http://10.0.0.2/x"))
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        __import__("http.client").client.BadStatusLine("garbage"),
+        __import__("http.client").client.IncompleteRead(b"x"),
+        __import__("http.client").client.InvalidURL("no spaces"),
+        UnicodeEncodeError("latin-1", "é", 0, 1, "no"),
+        RecursionError(),
+    ],
+)
+def test_malformed_answers_become_app_errors_not_500s(monkeypatch, exc):
+    def boom(req):
+        raise exc
+
+    monkeypatch.setattr(integrations, "make_opener", lambda *extra: OpenerOf(boom))
+    with pytest.raises(integrations.AppError, match="could not reach"):
+        integrations.http_get_json("http://10.0.0.2:8989/x", "X-Api-Key", "k")
+
+
+def test_deeply_nested_json_is_an_app_error(monkeypatch):
+    body = b"[" * 100_000 + b"]" * 100_000
+
+    class R(DripResponse):
+        sent = False
+
+        def read(self, n=-1):
+            if R.sent:
+                return b""
+            R.sent = True
+            return body
+
+    monkeypatch.setattr(integrations, "make_opener", lambda *extra: OpenerOf(lambda req: R()))
+    with pytest.raises(integrations.AppError, match="not JSON"):
+        integrations.http_get_json("http://10.0.0.2:8989/x", "X-Api-Key", "k")
+
+
+def test_a_hanging_address_cannot_hold_the_call_for_ever(monkeypatch):
+    monkeypatch.setattr(integrations, "FIRST_OK_TIMEOUT", 0.2)
+    release = threading.Event()
+
+    def stuck(base):
+        release.wait(5)
+        return {}
+
+    start = time.monotonic()
+    with pytest.raises(integrations.AppError, match="took too long"):
+        integrations.first_ok(["http://a:1", "http://b:2"], stuck)
+    release.set()
+    assert time.monotonic() - start < 2
+
+
+@pytest.mark.parametrize("path", ["/api/a b", "/api/a\tb", "/api/a\r\nHost: x", "/api/a\x00b"])
+def test_paths_with_whitespace_or_control_characters_are_rejected(tmp_path, path):
+    write(tmp_path, "x.yml", GOOD.replace("test_path: /api/ping", f"test_path: {json.dumps(path)}"))
+    adapters, problems = integrations.load_adapters(str(tmp_path))
+    assert adapters == {} and "must not contain spaces or control characters" in problems[0]
+
+
+# ---- adapter files that are not what they should be ---------------------------------
+
+def test_a_binary_adapter_file_is_skipped_not_fatal(tmp_path):
+    write(tmp_path, "good.yml", GOOD)
+    (tmp_path / "binary.yml").write_bytes(b"\xff\xfe\x00\x80 not text")
+    adapters, problems = integrations.load_adapters(str(tmp_path))
+    assert list(adapters) == ["demo"] and len(problems) == 1 and problems[0].startswith("binary.yml")
+
+
+def test_a_huge_or_deeply_nested_adapter_file_is_skipped(tmp_path, monkeypatch):
+    write(tmp_path, "good.yml", GOOD)
+    write(tmp_path, "huge.yml", GOOD + "# " + "x" * integrations.MAX_ADAPTER_FILE)
+    write(tmp_path, "deep.yml", "[" * 50_000 + "]" * 50_000)
+    adapters, problems = integrations.load_adapters(str(tmp_path))
+    assert list(adapters) == ["demo"] and sorted(p.split(":")[0] for p in problems) == ["deep.yml", "huge.yml"]
+
+
+# ---- key_file hardening --------------------------------------------------------------
+
+def tar_of(members):
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, text in members:
+            data = text.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return [buf.getvalue()]
+
+
+def test_a_regex_whose_group_did_not_take_part_finds_nothing_instead_of_crashing():
+    kf = {"path": "/c.xml", "regex": "(x)?abc"}
+    assert integrations.key_from_archive(tar_of([("c.xml", "abc")]), kf) is None
+    assert integrations.key_from_archive(tar_of([("c.xml", "xabc")]), kf) == "x"
+
+
+def test_the_regex_only_scans_the_start_of_the_file():
+    kf = {"path": "/c.xml", "regex": "<K>([^<]+)</K>"}
+    late = " " * integrations.MAX_KEY_SCAN + "<K>late</K>"
+    assert integrations.key_from_archive(tar_of([("c.xml", late)]), kf) is None
+    assert integrations.key_from_archive(tar_of([("c.xml", "<K>early</K>")]), kf) == "early"
+
+
+@pytest.mark.parametrize("regex", ["(a+)+$", "(.*)*x", "(?:(?:ab)*)+(k)", "(?:a|b*){2,}(k)", r"(?:\d+)*(k)"])
+def test_a_regex_that_can_backtrack_without_end_is_rejected(tmp_path, regex):
+    write(tmp_path, "x.yml", GOOD + f"key_file: {{path: /c, regex: {json.dumps(regex)}}}\n")
+    adapters, problems = integrations.load_adapters(str(tmp_path))
+    assert adapters == {} and (regex.startswith("(?:") is False or "repeat a group" in problems[0])
+
+
+@pytest.mark.parametrize("regex", ["<ApiKey>([^<]+)</ApiKey>", "key=(\\w+)", "(x)?abc", "token: *(\\S+)"])
+def test_ordinary_key_regexes_are_still_accepted(tmp_path, regex):
+    write(tmp_path, "x.yml", GOOD + f"key_file: {{path: /c, regex: {json.dumps(regex)}}}\n")
+    assert integrations.load_adapters(str(tmp_path))[1] == []
+
+
+def test_only_the_named_file_counts_not_the_first_file_of_a_directory():
+    kf = {"path": "/config", "json_path": "k"}  # a directory: the tar holds config/..., not a file called config
+    assert integrations.key_from_archive(tar_of([("config/other.json", '{"k": "wrong"}')]), kf) is None
+    kf = {"path": "/config/a.json", "json_path": "k"}
+    assert integrations.key_from_archive(tar_of([("a.json", '{"k": "right"}')]), kf) == "right"
+    assert integrations.key_from_archive(tar_of([("b.json", '{"k": "wrong"}')]), kf) is None
+    assert integrations.key_from_archive(tar_of([("a.json", '{"k": "1"}'), ("a.json", '{"k": "2"}')]), kf) is None
+
+
+def test_the_archive_stream_is_closed_even_on_an_early_return():
+    class Stream:
+        closed = False
+
+        def __iter__(self):
+            yield b"x" * (integrations.MAX_KEY_FILE * 2 + 1)
+
+        def close(self):
+            self.closed = True
+
+    s = Stream()
+    assert integrations.key_from_archive(s, {"path": "/c", "json_path": "k"}) is None
+    assert s.closed
+
+
+# ---- handlers: wrong shapes below the top level ----------------------------------------
+
+SEERR_SPEC = {"match": {"port": 5055}, "auth": {"header": "X-Api-Key"}}
+
+
+def test_a_seerr_answer_of_the_wrong_shape_is_an_app_error(monkeypatch):
+    def fake(url, header, key, timeout=5):
+        return {"results": ["not a dict"], "pageInfo": {}}
+
+    monkeypatch.setattr(integrations, "http_get_json", fake)
+    with pytest.raises(integrations.AppError, match="expected shape"):
+        handlers.HANDLERS["seerr"].fetch(["http://s:1"], SEERR_SPEC, "k")
+
+
+@pytest.mark.parametrize("tmdb", ["1/../../x", 1.5, True, -3, 0, None, [1], "5"])
+def test_only_a_real_tmdb_number_goes_into_the_path(monkeypatch, tmdb):
+    asked = []
+    monkeypatch.setattr(integrations, "http_get_json", lambda url, *a, **k: asked.append(url) or {"title": "T"})
+    assert handlers._seerr_title(["http://s:1"], SEERR_SPEC, "k", "movie", tmdb) == "Unknown"
+    assert asked == []
+
+
+def test_a_title_that_is_not_text_is_not_kept_and_the_cache_is_bounded(monkeypatch):
+    monkeypatch.setattr(integrations, "http_get_json", lambda url, *a, **k: {"title": {"x": 1}})
+    assert handlers._seerr_title(["http://s:1"], SEERR_SPEC, "k", "movie", 5) == "Unknown"
+    assert handlers._titles == {}
+    monkeypatch.setattr(integrations, "http_get_json", lambda url, *a, **k: {"title": "T" * 5000})
+    monkeypatch.setattr(handlers, "MAX_TITLES", 3)
+    for i in range(1, 8):
+        assert len(handlers._seerr_title(["http://s:1"], SEERR_SPEC, "k", "movie", i)) == handlers.MAX_TITLE
+    assert len(handlers._titles) == 3 and ("movie", 7) in handlers._titles
+
+
+def test_a_handler_check_reports_a_wrong_shape_as_a_message(monkeypatch):
+    def fake(url, header, key, timeout=5):
+        return ["not", "a", "dict"]
+
+    monkeypatch.setattr(integrations, "http_get_json", fake)
+    problem = handlers.HANDLERS["pelican"].check(["http://p:1"], {}, {"application": "k"})
+    assert problem is None  # a check only needs the key accepted; the shape is the fetch's business
+    with pytest.raises(integrations.AppError, match="expected shape"):
+        handlers.HANDLERS["pelican"].fetch(["http://p:1"], {}, {"application": "k"})
+
+
+# ---- qBittorrent: wrong login is not retried every poll ---------------------------------
+
+BASES = ["http://10.0.0.9:8080"]
+
+
+def test_qbittorrent_logs_in_at_most_once_with_a_wrong_password_across_polls(monkeypatch):
+    fake = FakeQbt(new_style=True)
+    monkeypatch.setattr(handlers, "_send", fake)
+    wrong = {"username": "admin", "password": "nope"}
+    for _ in range(6):
+        with pytest.raises(integrations.AppError, match="rejected the login"):
+            handlers.HANDLERS["qbittorrent"].fetch(BASES, {}, wrong)
+    assert fake.logins == 1
+
+
+def test_a_fresh_check_is_not_held_back_by_an_earlier_refusal(monkeypatch):
+    fake = FakeQbt(new_style=True)
+    monkeypatch.setattr(handlers, "_send", fake)
+    wrong = {"username": "admin", "password": "nope"}
+    with pytest.raises(integrations.AppError):
+        handlers.HANDLERS["qbittorrent"].fetch(BASES, {}, wrong)
+    assert handlers.qbt_check(BASES, {}, wrong) == "the app rejected the login"
+    assert fake.logins == 2  # the admin asked again, so it really tried
+
+
+def test_the_right_password_after_a_refusal_works_at_once(monkeypatch):
+    fake = FakeQbt(new_style=True)
+    monkeypatch.setattr(handlers, "_send", fake)
+    with pytest.raises(integrations.AppError):
+        handlers.HANDLERS["qbittorrent"].fetch(BASES, {}, {"username": "admin", "password": "nope"})
+    [panel] = handlers.HANDLERS["qbittorrent"].fetch(BASES, {}, {"username": "admin", "password": "s3cret pass"})
+    assert panel["total"] == 3
+
+
+def test_a_changed_password_does_not_keep_using_the_old_session(monkeypatch):
+    fake = FakeQbt(new_style=True)
+    monkeypatch.setattr(handlers, "_send", fake)
+    handlers.HANDLERS["qbittorrent"].fetch(BASES, {}, {"username": "admin", "password": "s3cret pass"})
+    assert fake.logins == 1
+    fake.password = "newer"
+    with pytest.raises(integrations.AppError, match="rejected the login"):
+        handlers.HANDLERS["qbittorrent"].fetch(BASES, {}, {"username": "admin", "password": "wrong"})
+    assert fake.logins == 2
+    handlers.HANDLERS["qbittorrent"].fetch(BASES, {}, {"username": "admin", "password": "newer"})
+    assert fake.logins == 3
+
+
+def test_forget_sessions_drops_sessions_and_refusals(monkeypatch):
+    fake = FakeQbt(new_style=True)
+    monkeypatch.setattr(handlers, "_send", fake)
+    good = {"username": "admin", "password": "s3cret pass"}
+    handlers.HANDLERS["qbittorrent"].fetch(BASES, {}, good)
+    with pytest.raises(integrations.AppError):
+        handlers.HANDLERS["qbittorrent"].fetch(BASES, {}, {"username": "admin", "password": "nope"})
+    assert handlers._sessions and handlers._login_denied
+    handlers.forget_sessions()
+    assert not handlers._sessions and not handlers._login_denied

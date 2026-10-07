@@ -45,3 +45,6 @@ docker-compose*.yml
 *.swp
 *~
 .DS_Store
+
+# Private research notes
+docs-private/

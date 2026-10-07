@@ -1,2 +1,5 @@
 -r requirements.txt
 pytest==8.3.3
+# for regenerating requirements.txt and auditing it (see requirements.in)
+pip-tools==7.6.2
+pip-audit==2.10.1

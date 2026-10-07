@@ -52,8 +52,6 @@ const panels = new Map();
 let shownColumns = []; // the panel ids in each visible column, as last placed
 let columnsN = 0;
 
-// per-browser view state. Collapsed panels are kept by panel id; older versions kept
-// groups by bare name.
 // How often the page asks the server, in seconds: the container list (with the host vitals) and
 // the integration panels are set separately.
 const LIST_RATES = [[2, "Every 2 seconds"], [5, "Every 5 seconds"], [15, "Every 15 seconds"], [60, "Every minute"]];
@@ -61,6 +59,8 @@ const PANEL_RATES = [[10, "Every 10 seconds"], [30, "Every 30 seconds"], [60, "E
 const DEFAULT_RATES = { listRefresh: 5, panelRefresh: 30 };
 // older versions kept one preset for both
 const OLD_PRESETS = { fast: [2, 10], normal: [5, 30], relaxed: [15, 60], slow: [60, 180] };
+// per-browser view state. Collapsed panels are kept by panel id; older versions kept
+// groups by bare name.
 const view = (() => {
   const defaults = { collapsed: {}, maxColumns: 3, ...DEFAULT_RATES };
   try {
@@ -109,6 +109,15 @@ function showError(msg) {
   errorEl.hidden = !msg;
 }
 
+// What stays in the banner until it is dealt with, so a poll can't wipe it a moment later:
+// a layout save that was refused (until the next one works) and the last failed action or edit.
+const sticky = { save: "", action: "" };
+function setError(kind, msg) {
+  sticky[kind] = msg;
+  showErrors();
+}
+function showErrors() { showError(Object.values(sticky).filter(Boolean).join(" ")); }
+
 function fmtBytes(b) {
   if (b === null || b === undefined) return "–";
   if (b >= 1024 ** 4) return (b / 1024 ** 4).toFixed(2) + " TB";
@@ -116,8 +125,12 @@ function fmtBytes(b) {
   return Math.round(b / 1024 ** 2) + " MB";
 }
 
-async function api(url, options) {
-  const res = await fetch(url, options);
+// Every state-changing call carries the CSRF token; a string body is sent as JSON.
+async function api(url, options = {}) {
+  const headers = { ...options.headers };
+  if (options.method && options.method !== "GET") headers["X-CSRF-Token"] = csrf;
+  if (typeof options.body === "string") headers["Content-Type"] = "application/json";
+  const res = await fetch(url, { ...options, headers });
   if (res.redirected || res.status === 401) {
     location.reload();
     throw new Error("session expired");
@@ -148,7 +161,7 @@ function setContainerPriority(name, level) {
   else delete groupSettings.container_priority[name];
 }
 
-// A friendly name set in edit mode, else the container's `dashboard.name` label.
+// A friendly name set in edit mode, else the container's `ratatosk.name` label.
 // Display-only: the container keeps its real name, which is still what every API call
 // uses.
 // A game server's real name comes from Pelican, if that is set up.
@@ -246,18 +259,21 @@ function panelTitle(id) {
   return item ? item.adapter_name : id;
 }
 
-async function saveGroups() {
+// One save at a time, so edits can't land out of order: a save asked for while another runs
+// becomes a single trailing one that sends the newest settings. A refused save keeps its message
+// in the banner until a later save works.
+let savesDone = 0;
+const saveGroups = EditLogic.coalesce(async () => {
+  let failure = "";
   try {
-    const body = await api("/api/groups", {
-      method: "PUT",
-      headers: { "X-CSRF-Token": csrf, "Content-Type": "application/json" },
-      body: JSON.stringify(groupSettings),
-    });
-    if (body.error) showError("Saving groups: " + body.error);
+    const body = await api("/api/groups", { method: "PUT", body: JSON.stringify(groupSettings) });
+    if (body.error) failure = "Saving groups: " + body.error;
   } catch (e) {
-    showError("Saving groups: " + e);
+    failure = "Saving groups: " + e;
   }
-}
+  savesDone++;
+  setError("save", failure);
+});
 
 // bumped on every local layout edit; a poll that started before an edit must not
 // overwrite it with the older server copy
@@ -281,6 +297,11 @@ function moveTo(c, target) {
 function renameGroup(oldName, newName) {
   newName = newName.trim();
   if (!newName || newName === oldName) { render(true); return; }
+  // a name that is already a group would silently merge the two; the server also caps the length
+  const taken = [UNGROUPED, ...allGroupNames(), ...groupSettings.group_order, ...groupSettings.custom_groups, ...containers.map((c) => c.project).filter(Boolean)];
+  const problem = EditLogic.groupNameProblem(newName, oldName, taken);
+  if (problem) { setError("action", problem); render(true); return; }
+  setError("action", "");
   containers.filter((c) => groupOf(c) === oldName).forEach((c) => { groupSettings.assignments[c.name] = newName; });
   const swap = (list) => list.map((g) => (g === oldName ? newName : g));
   groupSettings.custom_groups = swap(groupSettings.custom_groups);
@@ -480,7 +501,9 @@ function dragHandle(wrap) {
     const c = containers.find((x) => x.name === name);
     if (!c) return;
     const names = Layout.flatten(shownColumns).filter((id) => id.startsWith("group:")).map((id) => id.slice(6));
-    const i = names.indexOf(groupOf(c)) + (e.key === "ArrowDown" ? 1 : -1);
+    const at = names.indexOf(groupOf(c));
+    if (at < 0) return; // its group is not on the page (hidden), so there is no neighbour
+    const i = at + (e.key === "ArrowDown" ? 1 : -1);
     if (i < 0 || i >= names.length) return;
     moveTo(c, names[i]);
     // the DOM was rebuilt; return keyboard focus to this container's handle
@@ -491,18 +514,26 @@ function dragHandle(wrap) {
 
 // ---- container rows -----------------------------------------------------
 
+// A small button for a dialog; `fn` gets the button.
+function miniButton(label, cls, fn) {
+  const b = el("button", "mini" + (cls ? " " + cls : ""), label);
+  b.type = "button";
+  b.addEventListener("click", () => fn(b));
+  return b;
+}
+
 async function act(name, action, btn) {
   if (editing) return;
   btn.disabled = true;
-  showError("");
+  setError("action", "");
   try {
-    const body = await api(`/api/containers/${encodeURIComponent(name)}/${action}`, {
-      method: "POST",
-      headers: { "X-CSRF-Token": csrf },
-    });
-    if (body.error) showError(`${action} ${name}: ${body.error}`);
+    const body = await api(`/api/containers/${encodeURIComponent(name)}/${action}`, { method: "POST" });
+    if (body.error) setError("action", `${action} ${name}: ${body.error}`);
   } catch (e) {
-    showError(`${action} ${name}: ${e}`);
+    setError("action", `${action} ${name}: ${e}`);
+  } finally {
+    // a restart leaves the container "running" as before, so the row keeps this very button
+    btn.disabled = false;
   }
   refresh();
   // a Pelican panel row shows the state too, and a power action takes a few seconds to show
@@ -516,17 +547,13 @@ async function act(name, action, btn) {
 function deleteContainer(c) {
   if (editing) return;
   const name = displayName(c);
-  const button = (label, cls, fn) => {
-    const b = el("button", "mini" + (cls ? " " + cls : ""), label);
-    b.type = "button";
-    b.addEventListener("click", () => fn(b));
-    return b;
-  };
   const dlg = el("dialog", "cfg narrow");
   const title = el("h2", null, `Delete ${name}`);
+  title.id = "delete-title";
+  dlg.setAttribute("aria-labelledby", title.id);
   const body = el("div", "cfg-body");
   const foot = el("div", "cfg-foot");
-  const close = button("Cancel", "", () => dlg.close());
+  const close = miniButton("Cancel", "", () => dlg.close());
   dlg.append(el("div", "cfg-head", undefined), body);
   dlg.firstChild.append(title);
   body.append(foot);
@@ -549,7 +576,7 @@ function deleteContainer(c) {
       return label;
     });
     body.prepend(...list, el("p", "hint", "Named volumes and mounted folders are never deleted."));
-    foot.replaceChildren(button("Continue", "primary", confirmStep), close);
+    foot.replaceChildren(miniButton("Continue", "primary", confirmStep), close);
   };
 
   const confirmStep = () => {
@@ -557,23 +584,19 @@ function deleteContainer(c) {
     body.prepend(el("p", null, volumes
       ? `This will permanently delete the container ${c.name} and its anonymous volumes. Data stored in those volumes is lost. This can't be undone. Are you sure?`
       : `This will permanently delete the container ${c.name}. Its anonymous volumes are kept. This can't be undone. Are you sure?`));
-    const yes = button("Yes, delete", "danger", async () => {
+    const yes = miniButton("Yes, delete", "danger", async () => {
       yes.disabled = true;
-      showError("");
+      setError("action", "");
       try {
-        const res = await api(`/api/containers/${encodeURIComponent(c.name)}`, {
-          method: "DELETE",
-          headers: { "X-CSRF-Token": csrf, "Content-Type": "application/json" },
-          body: JSON.stringify({ volumes }),
-        });
-        if (res.error) showError(`delete ${c.name}: ${res.error}`);
+        const res = await api(`/api/containers/${encodeURIComponent(c.name)}`, { method: "DELETE", body: JSON.stringify({ volumes }) });
+        if (res.error) setError("action", `delete ${c.name}: ${res.error}`);
       } catch (e) {
-        showError(`delete ${c.name}: ${e}`);
+        setError("action", `delete ${c.name}: ${e}`);
       }
       dlg.close();
       refresh();
     });
-    foot.replaceChildren(yes, button("Back", "", choose), close);
+    foot.replaceChildren(yes, miniButton("Back", "", choose), close);
   };
 
   dlg.addEventListener("close", () => dlg.remove());
@@ -591,15 +614,14 @@ async function updateContainer(c, btn) {
   );
   if (!ok) return;
   btn.disabled = true;
-  showError("");
+  setError("action", "");
   try {
-    const body = await api(`/api/containers/${encodeURIComponent(c.name)}/update`, {
-      method: "POST",
-      headers: { "X-CSRF-Token": csrf },
-    });
-    if (body.error) showError(`update ${c.name}: ${body.error}`);
+    const body = await api(`/api/containers/${encodeURIComponent(c.name)}/update`, { method: "POST" });
+    if (body.error) setError("action", `update ${c.name}: ${body.error}`);
   } catch (e) {
-    showError(`update ${c.name}: ${e}`);
+    setError("action", `update ${c.name}: ${e}`);
+  } finally {
+    btn.disabled = false;
   }
   refresh();
 }
@@ -841,13 +863,14 @@ function makeItem(name) {
       // focus isn't lost to every poll
       const running = wings ? wings !== "offline" : c.status === "running";
       const canDelete = role === "admin" && !c.game && !c.self && ["exited", "created", "dead"].includes(c.status);
-      const key = [running, c.self, readOnly, upd?.state, upd?.blocked, canDelete].join("|");
+      const canUpdate = role === "admin" && upd && upd.state !== "running" && !c.self; // updating is an admin action
+      const key = [running, c.self, readOnly, upd?.state, upd?.blocked, canDelete, canUpdate].join("|");
       if (key === actionKey) return;
       actionKey = key;
       actionBtns.replaceChildren();
       updateSlot.replaceChildren();
       if (readOnly) return;
-      if (upd && upd.state !== "running" && !c.self) {
+      if (canUpdate) {
         const b = el("button", "act update", "Update");
         b.type = "button";
         if (upd.blocked) {
@@ -914,13 +937,16 @@ function makePanel(id, kind) {
     panels.get(id)?.el.querySelector(".grip")?.focus();
   });
 
+  // the heading holds the button (not the other way round), so headings can be navigated
+  const heading = el("h2", "ph-h");
   const main = el("button", "ph-main");
   main.type = "button";
   main.setAttribute("aria-expanded", String(!view.collapsed[id]));
-  const title = el("h2", "ph-title");
+  const title = el("span", "ph-title");
   const meta = el("span", "ph-meta");
   const tail = el("span", "ph-tail");
   main.append(title, meta, tail, icon("chevron"));
+  heading.append(main);
   main.addEventListener("click", () => {
     const off = box.classList.toggle("collapsed");
     view.collapsed[id] = off;
@@ -940,11 +966,11 @@ function makePanel(id, kind) {
   });
 
   const body = el("div", "pb");
-  head.append(grip, main, edit, eye);
+  head.append(grip, heading, edit, eye);
   box.append(head, body);
 
   const panel = {
-    id, kind, el: box, main, body, edit, key: "",
+    id, kind, el: box, main: heading, body, edit, key: "", // `main` is what a rename swaps for its input
     setHead(text, note, lights) {
       title.textContent = text;
       meta.textContent = note || "";
@@ -967,31 +993,33 @@ function led(state) {
 
 // ---- host panel
 
+// The host panel's CPU and memory nodes, kept here (not looked up by id) so the numbers can be
+// written while the panel is hidden and so not in the page.
+let hostNodes = null;
+
 function buildHost() {
   const p = makePanel("host", "host");
   p.setHead("Host", "", [led("ok")]);
-  const meter = (label, valueId, barId, subId) => {
-    const m = el("div", "meter");
+  const meter = (label) => {
+    const node = el("div", "meter");
     const line = el("div", "mh");
     const value = el("span", "mv", "–");
-    value.id = valueId;
     line.append(el("span", "", label), value);
     const bar = el("div", "bar");
     const fill = el("i");
-    fill.id = barId;
     bar.append(fill);
     const sub = el("div", "ph-note");
-    sub.id = subId;
-    m.append(line, bar, sub);
-    return m;
+    node.append(line, bar, sub);
+    return { node, value, fill, sub };
   };
+  const cpu = meter("CPU");
+  const mem = meter("Memory");
+  hostNodes = { cpu, mem };
   const disks = el("div", "meters");
-  disks.id = "v-disks";
   disksBox = disks;
-  p.body.append(meter("CPU", "v-cpu", "v-cpu-bar", "v-cpu-sub"), meter("Memory", "v-mem", "v-mem-bar", "v-mem-sub"), disks);
+  p.body.append(cpu.node, mem.node, disks);
   const add = el("button", "mini", "Add disk");
   add.type = "button";
-  add.disabled = false;
   add.addEventListener("click", () => { if (!addDiskOpen) openAddDisk(); });
   p.edit.append(add);
   p.update = () => {
@@ -1002,13 +1030,14 @@ function buildHost() {
 }
 
 function renderVitals(v) {
-  document.getElementById("v-cpu").textContent = Math.round(v.cpu_percent) + "%";
-  document.getElementById("v-cpu-bar").style.width = Math.min(v.cpu_percent, 100) + "%";
-  document.getElementById("v-cpu-sub").textContent = v.cpu_count + " cores";
+  const { cpu, mem } = hostNodes;
+  cpu.value.textContent = Math.round(v.cpu_percent) + "%";
+  cpu.fill.style.width = Math.min(v.cpu_percent, 100) + "%";
+  cpu.sub.textContent = v.cpu_count + " cores";
   const memPct = (v.mem_used / v.mem_total) * 100;
-  document.getElementById("v-mem").textContent = fmtBytes(v.mem_used);
-  document.getElementById("v-mem-bar").style.width = memPct + "%";
-  document.getElementById("v-mem-sub").textContent = `of ${fmtBytes(v.mem_total)} · ${Math.round(memPct)}%`;
+  mem.value.textContent = fmtBytes(v.mem_used);
+  mem.fill.style.width = memPct + "%";
+  mem.sub.textContent = `of ${fmtBytes(v.mem_total)} · ${Math.round(memPct)}%`;
   renderDisks(v.disks || []);
 }
 
@@ -1059,6 +1088,9 @@ function renameDisk(index, labelEl) {
   input.addEventListener("blur", () => finish(true));
 }
 
+// Why a disk can be missing from the list, and what to do about it.
+const DISK_HELP = "Not listed? Ratatosk only sees disks that something is mounted from. Add a read-only mount of a folder on that disk to Ratatosk's compose file (for example /home:/host/home:ro), recreate it, then reopen this. See the README.";
+
 // The form under the meters: pick one of the disks the container can see, name it, add it.
 function addDiskForm() {
   const form = el("form", "disk-form");
@@ -1072,7 +1104,7 @@ function addDiskForm() {
     form.append(el("p", "ph-note", availableDisks.length
       ? "Every disk Ratatosk can see is already shown."
       : "Ratatosk can't see any disks."));
-    form.append(el("p", "ph-note", "To show another disk, mount a folder from it into Ratatosk's container (read-only is fine), for example /srv/data:/host/data:ro, then reopen this. See the README."));
+    form.append(el("p", "ph-note", DISK_HELP));
     const close = el("button", "mini", "Close");
     close.type = "button";
     close.addEventListener("click", () => { addDiskOpen = false; render(true); });
@@ -1105,7 +1137,7 @@ function addDiskForm() {
     addDiskOpen = false;
     saveDisks([...groupSettings.disks, { label, path: pick.value }]);
   });
-  form.append(pick, name, add, cancel);
+  form.append(pick, name, add, cancel, el("p", "ph-note", DISK_HELP));
   return form;
 }
 
@@ -1172,7 +1204,7 @@ async function openAddDisk() {
 
 // ---- link tiles (the Links panel)
 
-// A container's link: its `dashboard.url` label, or its best published port on whatever
+// A container's link: its `ratatosk.url` label, or its best published port on whatever
 // host name this page was opened with (so it works over a LAN, Tailscale or a domain).
 function linkHref(c) {
   const l = c.link;
@@ -1288,6 +1320,7 @@ function buildGroup(id) {
       ren.addEventListener("click", () => {
         const input = el("input", "rename-input");
         input.value = name;
+        input.maxLength = EditLogic.MAX_GROUP_NAME;
         input.setAttribute("aria-label", "Group name");
         p.main.hidden = true;
         p.edit.hidden = true;
@@ -1468,18 +1501,25 @@ function render(force, forceInt) {
   updateToggleAll();
 }
 
-async function refresh() {
+// Both polls run one at a time (a slow Docker can't pile requests up and paint older data over
+// newer); a call made during a run, such as right after an action, runs once more when it ends.
+const refresh = EditLogic.coalesce(loadList);
+
+async function loadList() {
   const editsAtStart = localEdits;
+  const savesAtStart = savesDone;
   try {
     const [list, vitals] = await Promise.all([api(`/api/containers?age=${view.listRefresh}`), api("/api/vitals")]);
     if (list.error) { listError = list.error; showError(list.error); setTab("exited", "can't reach Docker"); summaryEl.dataset.key = ""; return; }
     listError = "";
-    showError("");
+    showErrors(); // a refused save or a failed action stays until it is dealt with
     containers = list.items;
     readOnly = list.read_only;
     role = list.role;
+    applyRole();
     loaded = true;
-    if (!dragging && localEdits === editsAtStart) groupSettings = list.groups;
+    // the server's copy may predate a save that is running or just finished, so it must not replace newer local edits
+    if (!dragging && localEdits === editsAtStart && savesDone === savesAtStart && !saveGroups.busy()) groupSettings = list.groups;
     renderVitals(vitals);
     render(false);
   } catch (e) {
@@ -1497,6 +1537,13 @@ async function refresh() {
 let integrationData = { items: [], problems: [] };
 // per container: the manual-key form is open / a message to show / a request in flight
 const manualOpen = new Set();
+// forms to focus when they are first built; a rebuild of the panel later must not steal focus
+const focusPending = new Set();
+function openManual(container) {
+  manualOpen.add(container);
+  focusPending.add(container);
+  renderIntegrations(true);
+}
 const integrationMsg = new Map();
 const integrationBusy = new Set();
 
@@ -1513,11 +1560,8 @@ async function integrationCall(name, path, method, body) {
   integrationMsg.delete(name);
   renderIntegrations(true);
   try {
-    const opts = { method, headers: { "X-CSRF-Token": csrf } };
-    if (body) {
-      opts.headers["Content-Type"] = "application/json";
-      opts.body = JSON.stringify(body);
-    }
+    const opts = { method };
+    if (body) opts.body = JSON.stringify(body);
     const res = await api(`/api/integrations/${encodeURIComponent(name)}/${path}`, opts);
     if (res.error) integrationMsg.set(name, withHint(res.error));
     return !res.error;
@@ -1585,7 +1629,7 @@ function keysForm(item) {
     renderIntegrations(true);
   });
   form.append(...inputs, save, cancel);
-  setTimeout(() => inputs[0]?.focus(), 0);
+  if (focusPending.delete(item.container)) setTimeout(() => inputs[0]?.focus(), 0);
   return form;
 }
 
@@ -1624,7 +1668,7 @@ function manualForm(item) {
     renderIntegrations(true);
   });
   form.append(...(login ? [user] : []), secret, save, cancel);
-  setTimeout(() => (user || secret).focus(), 0);
+  if (focusPending.delete(item.container)) setTimeout(() => (user || secret).focus(), 0);
   return form;
 }
 
@@ -1681,12 +1725,10 @@ function openConfigDialog(r) {
   document.body.append(dlg);
   dlg.showModal();
 
-  const note = (text, bad) => el("p", "int-note" + (bad ? " bad" : ""), text);
-  const button = (label, cls, fn) => {
-    const b = el("button", "mini" + (cls ? " " + cls : ""), label);
-    b.type = "button";
-    b.addEventListener("click", () => fn(b));
-    return b;
+  const note = (text, bad) => {
+    const p = el("p", "int-note" + (bad ? " bad" : ""), text);
+    if (bad) p.setAttribute("role", "alert");
+    return p;
   };
 
   // The file list is fetched once and reused when you come back from a file; a save drops it
@@ -1700,7 +1742,7 @@ function openConfigDialog(r) {
       body.replaceChildren(note("Looking for config files…"));
       let res;
       try { res = await api(base); } catch (e) { body.replaceChildren(note(`${e}`, true)); return; }
-      if (res.error) { body.replaceChildren(note(res.error, true), button("Try again", "", () => showFiles(true))); return; }
+      if (res.error) { body.replaceChildren(note(res.error, true), miniButton("Try again", "", () => showFiles(true))); return; }
       filesRes = res;
     }
     const res = filesRes;
@@ -1724,8 +1766,8 @@ function openConfigDialog(r) {
   async function openFile(path) {
     body.replaceChildren(note("Opening…"));
     let res;
-    try { res = await api(`${base}/file?path=${encodeURIComponent(path)}`); } catch (e) { body.replaceChildren(note(`${e}`, true), button("Back", "", showFiles)); return; }
-    if (res.error) { body.replaceChildren(note(res.error, true), button("Back to files", "", showFiles)); return; }
+    try { res = await api(`${base}/file?path=${encodeURIComponent(path)}`); } catch (e) { body.replaceChildren(note(`${e}`, true), miniButton("Back", "", showFiles)); return; }
+    if (res.error) { body.replaceChildren(note(res.error, true), miniButton("Back to files", "", showFiles)); return; }
     showEditor(res, res.entries.length ? "fields" : "raw", "");
   }
 
@@ -1735,13 +1777,14 @@ function openConfigDialog(r) {
     let listValues = file.entries.map((e) => e.value);
     let rawArea = null;
     const err = el("p", "int-note bad");
+    err.setAttribute("role", "alert");
     err.hidden = true;
     const touched = () => { dirty = true; saveBtn.disabled = false; err.hidden = true; };
 
     const bar = el("div", "cfg-bar");
-    bar.append(button("‹ Files", "", () => { if (!dirty || confirm("Discard your changes?")) showFiles(); }), el("span", "mono cfg-path", file.path));
+    bar.append(miniButton("‹ Files", "", () => { if (!dirty || confirm("Discard your changes?")) showFiles(); }), el("span", "mono cfg-path", file.path));
 
-    const switchBtn = button(mode === "fields" ? "Raw text" : "Fields", "", () => {
+    const switchBtn = miniButton(mode === "fields" ? "Raw text" : "Fields", "", () => {
       if (dirty && !confirm("Switching drops your unsaved changes. Continue?")) return;
       showEditor(file, mode === "fields" ? "raw" : "fields", "");
     });
@@ -1763,13 +1806,13 @@ function openConfigDialog(r) {
           const input = el("input", "mono");
           input.value = v;
           input.addEventListener("input", () => { listValues[i] = input.value; touched(); });
-          const rm = button("Remove", "danger", () => { listValues.splice(i, 1); touched(); draw(); });
+          const rm = miniButton("Remove", "danger", () => { listValues.splice(i, 1); touched(); draw(); });
           row.append(input, rm);
           rows.append(row);
         });
       };
       draw();
-      form.append(rows, button("Add entry", "", () => { listValues.push(""); touched(); draw(); }));
+      form.append(rows, miniButton("Add entry", "", () => { listValues.push(""); touched(); draw(); }));
     } else {
       let section;
       for (const e of file.entries) {
@@ -1800,15 +1843,16 @@ function openConfigDialog(r) {
       }
     }
 
-    const saveBtn = button("Save", "primary", async (b) => {
+    const saveBtn = miniButton("Save", "primary", async (b) => {
       b.disabled = true;
       err.hidden = true;
       const payload = { path: file.path, hash: file.hash };
-      if (mode === "raw") payload.raw = rawArea.value;
+      // the textarea's line breaks are all "\n"; the file keeps the ending it had
+      if (mode === "raw") payload.raw = EditLogic.restoreEol(file.raw, rawArea.value);
       else payload.edits = file.format === "list" ? { entries: listValues } : edits;
       let res;
       try {
-        res = await api(`${base}/file`, { method: "PUT", headers: { "X-CSRF-Token": csrf, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        res = await api(`${base}/file`, { method: "PUT", body: JSON.stringify(payload) });
       } catch (e) { res = { error: `${e}` }; }
       if (res.error) {
         err.textContent = res.error;
@@ -1822,7 +1866,7 @@ function openConfigDialog(r) {
     saveBtn.disabled = true;
 
     const foot = el("div", "cfg-foot");
-    foot.append(saveBtn, button("Reload from server", "", () => { if (!dirty || confirm("Discard your changes?")) openFile(file.path); }), el("span", "int-note", status));
+    foot.append(saveBtn, miniButton("Reload from server", "", () => { if (!dirty || confirm("Discard your changes?")) openFile(file.path); }), el("span", "int-note", status));
     // the comments at the top of the file often say how it is used (e.g. "changes here are ignored")
     const about = file.header && file.header.length ? [el("div", "cfg-about", file.header.join("\n"))] : [];
     body.replaceChildren(bar, ...about, form, err, foot);
@@ -1848,8 +1892,14 @@ function openConfigDialog(r) {
     } else {
       input = el("input", "mono");
       input.value = value;
-      if (type === "int" || type === "float") input.inputMode = "decimal";
-      input.addEventListener("input", () => onChange(input.value));
+      if (type === "raw") {
+        // a nested list or struct: the server never rewrites it, so showing it editable would lose the edit
+        input.readOnly = true;
+        input.title = "A nested setting can't be edited here. Use Raw text.";
+      } else {
+        if (type === "int" || type === "float") input.inputMode = "decimal";
+        input.addEventListener("input", () => onChange(input.value));
+      }
     }
     row.append(input);
     wrap.prepend(row);
@@ -1878,6 +1928,13 @@ function openConfigDialog(r) {
 
 function fmtSize(n) { return n >= 1024 ? (n / 1024).toFixed(1) + " KB" : n + " B"; }
 
+// A failed action's message, announced to screen readers when it appears.
+function alertNote(text) {
+  const p = el("p", "int-note bad", text);
+  p.setAttribute("role", "alert");
+  return p;
+}
+
 // What goes inside an integration's panel: its data once set up, else the setup steps.
 function integrationBody(item) {
   const busy = integrationBusy.has(item.container);
@@ -1891,7 +1948,7 @@ function integrationBody(item) {
       const btn = el("button", "mini", missing.length === 1 ? `Add ${missing[0].label.toLowerCase()}` : "Add another key");
       btn.type = "button";
       btn.disabled = busy;
-      btn.addEventListener("click", () => { manualOpen.add(item.container); renderIntegrations(true); });
+      btn.addEventListener("click", () => openManual(item.container));
       add.append(btn);
       if (!manualOpen.has(item.container)) {
         if (!item.auth_keys.some((k) => k.set && k.sufficient)) out.append(el("p", "int-note", `Not set: ${missing.map((k) => k.label).join(", ")}. Each key is optional and switches on its own part of ${item.adapter_name}.`));
@@ -1930,7 +1987,7 @@ function integrationBody(item) {
     return setupBody(item);
   }
   const msg = integrationMsg.get(item.container);
-  if (msg) out.append(el("p", "int-note bad", msg));
+  if (msg) out.append(alertNote(msg));
   if (busy) out.append(el("p", "int-note", "Working..."));
   return out;
 }
@@ -1955,7 +2012,7 @@ function setupBody(item) {
   }
   const manual = el("button", "btn", login ? "Enter login" : keys ? "Enter keys" : "Enter key manually");
   manual.type = "button";
-  manual.addEventListener("click", () => { manualOpen.add(item.container); renderIntegrations(true); });
+  manual.addEventListener("click", () => openManual(item.container));
   const dismiss = el("button", "btn", "Dismiss");
   dismiss.type = "button";
   dismiss.addEventListener("click", () => integrationCall(item.container, "dismiss", "POST"));
@@ -1970,7 +2027,7 @@ function setupBody(item) {
   out.append(actions);
   if (manualOpen.has(item.container)) out.append(manualForm(item));
   const msg = integrationMsg.get(item.container);
-  if (msg) out.append(el("p", "int-note bad", msg));
+  if (msg) out.append(alertNote(msg));
   if (busy) out.append(el("p", "int-note", "Working..."));
   return out;
 }
@@ -2086,7 +2143,9 @@ function renderNotices() {
   noticesEl.replaceChildren(...nodes);
 }
 
-async function refreshIntegrations() {
+const refreshIntegrations = EditLogic.coalesce(loadIntegrations);
+
+async function loadIntegrations() {
   try {
     const body = await api(`/api/integrations?age=${view.panelRefresh}`);
     if (body.error) return;
@@ -2098,7 +2157,7 @@ async function refreshIntegrations() {
 
 async function restoreDismissed() {
   for (const i of integrationData.items.filter((x) => x.state === "dismissed")) {
-    await api(`/api/integrations/${encodeURIComponent(i.container)}/restore`, { method: "POST", headers: { "X-CSRF-Token": csrf } });
+    await api(`/api/integrations/${encodeURIComponent(i.container)}/restore`, { method: "POST" });
   }
   refreshIntegrations();
 }
@@ -2205,17 +2264,19 @@ function setDebugOpen(open) {
   loadDebug(true).then(() => { debugLog.scrollTop = debugLog.scrollHeight; });
   if (debugAuto.checked) debugTimer = setInterval(() => loadDebug(false), LOG_REFRESH_MS);
 }
+// The debug log is admin-only on the server; the role can change while the page is open.
+function applyRole() {
+  debugBtn.hidden = role !== "admin";
+  if (debugBtn.hidden && !debugEl.hidden) setDebugOpen(false);
+}
+applyRole();
 debugBtn.addEventListener("click", () => setDebugOpen(debugEl.hidden));
 document.getElementById("debug-close").addEventListener("click", () => { setDebugOpen(false); debugBtn.focus(); });
 debugAuto.addEventListener("change", () => setDebugOpen(true));
 debugWarn.addEventListener("change", renderDebug);
 debugLevel.addEventListener("change", async () => {
   try {
-    await api("/api/debug/level", {
-      method: "POST",
-      headers: { "X-CSRF-Token": csrf, "Content-Type": "application/json" },
-      body: JSON.stringify({ level: debugLevel.value }),
-    });
+    await api("/api/debug/level", { method: "POST", body: JSON.stringify({ level: debugLevel.value }) });
   } catch {}
   loadDebug(true);
 });
@@ -2252,15 +2313,25 @@ refreshIntegrations();
 // If the list still hasn't arrived after 15 s it asks whether to carry on, for a host where only the
 // host stats are wanted.
 const welcomeEl = document.getElementById("welcome");
+// The screen is a modal: while it shows, the rest of the page can't be reached by keyboard or screen reader.
+function setPageInert(on) {
+  for (const child of frame.children) if (child !== welcomeEl) child.inert = on;
+}
 if (location.search.includes("welcome")) history.replaceState(null, "", location.pathname);
 function startWelcome() {
+  setPageInert(true);
+  welcomeEl.tabIndex = -1;
+  welcomeEl.focus();
   const SEARCH_MS = 15000, STEP_MS = 1500;
   const title = document.getElementById("welcome-title");
   const text = document.getElementById("welcome-text");
   const spinner = document.getElementById("welcome-spinner");
   const actions = document.getElementById("welcome-actions");
   const proceed = document.getElementById("welcome-proceed");
-  const finish = () => { welcomeEl.hidden = true; };
+  const finish = () => {
+    welcomeEl.hidden = true;
+    setPageInert(false);
+  };
   let run = 0; // a newer search cancels an older one
   async function search() {
     const mine = ++run;
@@ -2290,13 +2361,14 @@ if (!welcomeEl.hidden) startWelcome();
 // shown again instead of waiting for the next tick (browsers slow timers in background tabs).
 let listTimer = null;
 let panelTimer = null;
+// A tick is skipped while the tab is hidden or the last request is still running.
 function startListPolling() {
   clearInterval(listTimer);
-  listTimer = setInterval(refresh, view.listRefresh * 1000);
+  listTimer = setInterval(() => { if (!document.hidden && !refresh.busy()) refresh(); }, view.listRefresh * 1000);
 }
 function startPanelPolling() {
   clearInterval(panelTimer);
-  panelTimer = setInterval(refreshIntegrations, view.panelRefresh * 1000);
+  panelTimer = setInterval(() => { if (!document.hidden && !refreshIntegrations.busy()) refreshIntegrations(); }, view.panelRefresh * 1000);
 }
 // Saved with the account (not this browser): kept in the group settings like the layout.
 groupByProject.addEventListener("change", () => {

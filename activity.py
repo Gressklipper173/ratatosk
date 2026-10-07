@@ -11,6 +11,7 @@ any secret registered through `set_secret_source` that still slips into a messag
 traceback.
 """
 
+import json
 import logging
 import re
 import sys
@@ -18,7 +19,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from urllib.parse import urlsplit
+from urllib.parse import quote, quote_plus, urlsplit
 
 MAX_ENTRIES = 2000
 MAX_BYTES = 512 * 1024
@@ -26,7 +27,6 @@ MAX_MESSAGE = 500
 MAX_TRACEBACK = 4000
 
 LEVELS = ("normal", "verbose")
-_NAMES = {"debug": 10, "info": 20, "warn": 30, "error": 40}
 
 _lock = threading.Lock()
 _entries = deque()
@@ -34,21 +34,37 @@ _bytes = 0
 _seq = 0
 _level = "normal"
 _secret_source = lambda: ()
+_last_secrets = ()
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
-# a secret shorter than this would blank out ordinary words
+_ANY_CONTROL = re.compile(r"[\x00-\x1f\x7f]")  # for one line of stderr: a newline would start a forged line
+# a secret shorter than this would blank out ordinary words, so shorter ones are not masked
+# (the login form allows a 1-character qBittorrent password; that one can't be protected here)
 _MIN_SECRET = 4
 
 
 def set_secret_source(fn):
     """`fn()` returns the secret strings currently stored (keys, passwords)."""
-    global _secret_source
+    global _secret_source, _last_secrets
     _secret_source = fn
+    _last_secrets = ()
+
+
+def _variants(secret):
+    """The secret as it appears in a log line: as is, URL-encoded (a form body, a query) and
+    JSON-escaped."""
+    return {secret, quote_plus(secret), quote(secret), json.dumps(secret)[1:-1], json.dumps(secret, ensure_ascii=False)[1:-1]}
 
 
 def redact(text):
-    for s in _secret_source():
-        if isinstance(s, str) and len(s) >= _MIN_SECRET:
-            text = text.replace(s, "***")
+    global _last_secrets
+    try:
+        _last_secrets = tuple(_secret_source())
+    except Exception:
+        pass  # an unreadable store must not break logging; keep masking what was known
+    found = {v for s in _last_secrets if isinstance(s, str) and len(s) >= _MIN_SECRET for v in _variants(s)}
+    # longest first: a secret that is part of another would leave the tail of the longer one
+    for v in sorted(found, key=len, reverse=True):
+        text = text.replace(v, "***")
     return text
 
 
@@ -75,7 +91,7 @@ def _add(level, source, msg, tb=None):
     global _bytes, _seq
     msg = _CONTROL.sub(" ", redact(str(msg)))[:MAX_MESSAGE]
     if tb:
-        msg += "\n" + redact(tb)[-MAX_TRACEBACK:]
+        msg += "\n" + _CONTROL.sub(" ", redact(tb))[-MAX_TRACEBACK:]
     entry = {"ts": time.time(), "level": level, "source": source, "msg": msg, "count": 1}
     size = len(msg) + len(source) + 48
     with _lock:
@@ -102,9 +118,9 @@ def log(level, source, msg, verbose=False, exc=False):
         return
     tb = traceback.format_exc() if exc else None
     _add(level, source, msg, tb)
-    print(f"[{source}] {level}: {redact(str(msg))[:MAX_MESSAGE]}", file=sys.stderr, flush=True)
+    print(f"[{source}] {level}: {_ANY_CONTROL.sub(' ', redact(str(msg)))[:MAX_MESSAGE]}", file=sys.stderr, flush=True)
     if tb:
-        print(redact(tb)[-MAX_TRACEBACK:], file=sys.stderr, flush=True)
+        print(_CONTROL.sub(" ", redact(tb))[-MAX_TRACEBACK:], file=sys.stderr, flush=True)
 
 
 def safe_url(url):
@@ -119,7 +135,7 @@ def safe_url(url):
 
 def snapshot(since=0, limit=MAX_ENTRIES):
     with _lock:
-        rows = [e for e in _entries if e["seq"] > since][-limit:]
+        rows = [e for e in _entries if e["seq"] > since][-limit:] if limit > 0 else []
         return [{k: e[k] for k in ("id", "seq", "ts", "level", "source", "msg", "count")} for e in rows], _seq
 
 

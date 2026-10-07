@@ -3,8 +3,14 @@ services:
     build: .
     container_name: ratatosk
     restart: unless-stopped
+    # Opens the dashboard on this machine only. To reach it from other devices on your
+    # network, change this to "8090:8090" (all interfaces), or to "<this host's LAN address>:8090:8090".
+    # Docker's published ports bypass the host firewall, so only do that on a private network.
     ports:
-      - "8090:8090"
+      - "127.0.0.1:8090:8090"
+    # Stops a process in the container gaining new privileges (Ratatosk itself runs as root).
+    security_opt:
+      - no-new-privileges:true
     environment:
       # set to true to disable start/stop/restart
       READ_ONLY: "false"
@@ -12,6 +18,9 @@ services:
       UPDATE_CHECK: "true"
       # set to true only if a reverse proxy or tunnel is the only way in (see README, Security)
       BEHIND_PROXY: "false"
+      # with BEHIND_PROXY: which header carries the visitor's address, "xff" (X-Forwarded-For,
+      # the default) or "cf" (Cloudflare's CF-Connecting-IP). The proxy must overwrite it.
+      # PROXY_IP_HEADER: "xff"
     # Ratatosk is meant to run all the time, so cap Docker's copy of its output.
     logging:
       driver: json-file

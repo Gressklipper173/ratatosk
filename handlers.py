@@ -12,12 +12,13 @@ for `auth.kind: login`. A panel is {"id", "title", "rows", "total"} plus an opti
 "summary"; a row is {"title", "detail"} plus an optional "progress" (0-100).
 """
 
+import functools
+import hashlib
 import http.cookiejar
 import json
 import re
 import threading
 import time
-import urllib.error
 import urllib.request
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +38,37 @@ def _shape_error():
     return AppError("the app's answer did not have the expected shape")
 
 
+# what an answer of the wrong shape below the top level raises: .lower() on a number, ["x"] on a
+# list, int() of the Infinity that Python's JSON parser accepts
+_SHAPE_ERRORS = (AttributeError, KeyError, TypeError, ValueError, OverflowError)
+
+
+def _guard(fn):
+    """fn, with a wrongly shaped answer turned into the AppError the panel list expects."""
+
+    @functools.wraps(fn)
+    def inner(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except _SHAPE_ERRORS:
+            raise _shape_error()
+
+    return inner
+
+
+def _guard_check(fn):
+    """The same for a `check`, which reports a problem as a message instead of raising."""
+
+    @functools.wraps(fn)
+    def inner(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except _SHAPE_ERRORS:
+            return str(_shape_error())
+
+    return inner
+
+
 # ---- Seerr ------------------------------------------------------------------
 
 SEERR_LISTS = (("pending", "Awaiting approval"), ("unavailable", "Not yet available"))
@@ -44,23 +76,32 @@ SEERR_LISTS = (("pending", "Awaiting approval"), ("unavailable", "Not yet availa
 # (media type, tmdb id) -> title. A request carries no title, only the media id, so each is
 # looked up once per process; a failed lookup is shown as "Unknown" and not remembered.
 _titles = {}
+_titles_lock = threading.Lock()
+MAX_TITLES = 1000
+MAX_TITLE = 200
 
 
 def _seerr_title(bases, spec, key, media_type, tmdb_id):
-    if not tmdb_id:
+    # the id goes into a path: only a real number may
+    if not isinstance(tmdb_id, int) or isinstance(tmdb_id, bool) or tmdb_id <= 0:
         return "Unknown"
-    ident = (media_type, tmdb_id)
-    if ident in _titles:
-        return _titles[ident]
     kind = "movie" if media_type == "movie" else "tv"
+    ident = (kind, tmdb_id)
+    with _titles_lock:
+        if ident in _titles:
+            return _titles[ident]
     try:
         _, data = integrations.call(bases, spec, key, f"/api/v1/{kind}/{tmdb_id}")
     except AppError:
         return "Unknown"
-    title = data.get("title") or data.get("name") if isinstance(data, dict) else None
-    if not title:
+    title = (data.get("title") or data.get("name")) if isinstance(data, dict) else None
+    if not isinstance(title, str) or not title:
         return "Unknown"
-    _titles[ident] = title
+    title = title[:MAX_TITLE]
+    with _titles_lock:
+        if len(_titles) >= MAX_TITLES:
+            _titles.pop(next(iter(_titles)))  # oldest first
+        _titles[ident] = title
     return title
 
 
@@ -86,15 +127,23 @@ def seerr_fetch(bases, spec, key):
             who = (r.get("requestedBy") or {}).get("displayName") or "unknown"
             rows.append({"title": name, "detail": f"{r.get('type') or '?'} · requested by {who}"})
         total = (data.get("pageInfo") or {}).get("results")
-        panels.append({"id": flt, "title": title, "rows": rows, "total": total if isinstance(total, int) else len(rows)})
+        panels.append({"id": flt, "title": title, "rows": rows, "total": total if isinstance(total, int) and not isinstance(total, bool) else len(rows)})
     return panels
 
 
 # ---- qBittorrent ------------------------------------------------------------
 
-# (base URL, username) -> opener holding the session cookie. In memory only; a session that
-# has expired is replaced on the next 401/403.
+# (base URL, username, hash of the password) -> opener holding the session cookie. In memory
+# only; a session that has expired is replaced on the next 401/403. The password is part of the
+# key so a changed password never keeps using the old session.
 _sessions = {}
+
+# (addresses, username, hash of the password) -> (until, message) for a login qBittorrent refused.
+# Polling again with the same wrong password would only earn an IP ban (qBittorrent bans after
+# 5 failures), so a refusal is remembered for a while.
+_login_denied = {}
+QBT_DENIED_TTL = 300
+QBT_DENIED = ("the app rejected the login", "qBittorrent refused")
 
 QBT_STATES = {
     "pausedDL": "paused",
@@ -111,29 +160,22 @@ QBT_STATES = {
 
 def _send(opener, req):
     """(status, body). Kept apart so tests can stand in for the network."""
-    where = f"{req.get_method()} {activity.safe_url(req.full_url)}"
-    started = time.monotonic()
+    return integrations._open(req, opener)
 
-    def took():
-        return f"{int((time.monotonic() - started) * 1000)} ms"
 
-    try:
-        with opener.open(req, timeout=integrations.REQUEST_TIMEOUT) as r:
-            status, body = r.status, r.read(integrations.MAX_RESPONSE + 1)
-    except urllib.error.HTTPError as e:
-        activity.log("warn", "adapter", f"{where} -> HTTP {e.code} ({took()})")
-        return e.code, b""
-    except (urllib.error.URLError, OSError) as e:
-        reason = getattr(e, "reason", e)
-        activity.log("info", "adapter", f"{where} -> no answer: {type(reason).__name__} ({took()})", verbose=True)
-        raise AppError("could not reach the app")
-    activity.log("info", "adapter", f"{where} -> HTTP {status}, {len(body)} bytes ({took()})", verbose=True)
-    return status, body
+def _cred_id(creds):
+    return creds["username"], hashlib.sha256(str(creds["password"]).encode()).hexdigest()
+
+
+def forget_sessions():
+    """Drop every qBittorrent session and remembered refusal: the stored credentials changed."""
+    _sessions.clear()
+    _login_denied.clear()
 
 
 def _qbt_login(base, creds):
     jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    opener = integrations.make_opener(urllib.request.HTTPCookieProcessor(jar))
     # qBittorrent's CSRF check wants a Referer on the app's own address
     req = urllib.request.Request(
         base + "/api/v2/auth/login",
@@ -156,13 +198,24 @@ def _qbt_login(base, creds):
 
 
 def _qbt_session(bases, creds, fresh=False):
-    user = creds["username"]
+    """(base, opener). `fresh` skips the stored session and any remembered refusal, for when the
+    admin has just entered the login or the session is known to be dead."""
+    ident = _cred_id(creds)
     if not fresh:
         for b in bases:
-            if (b, user) in _sessions:
-                return b, _sessions[(b, user)]
-    base, opener = integrations.first_ok(bases, lambda b: _qbt_login(b, creds))
-    _sessions[(base, user)] = opener
+            if (b, *ident) in _sessions:
+                return b, _sessions[(b, *ident)]
+        denied = _login_denied.get((tuple(bases), *ident))
+        if denied and denied[0] > time.monotonic():
+            raise AppError(denied[1])
+    try:
+        base, opener = integrations.first_ok(bases, lambda b: _qbt_login(b, creds))
+    except AppError as e:
+        if str(e).startswith(QBT_DENIED):
+            _login_denied[(tuple(bases), *ident)] = (time.monotonic() + QBT_DENIED_TTL, str(e))
+        raise
+    _login_denied.pop((tuple(bases), *ident), None)
+    _sessions[(base, *ident)] = opener
     return base, opener
 
 
@@ -171,13 +224,13 @@ def _qbt_json(bases, creds, path):
         base, opener = _qbt_session(bases, creds, fresh=attempt == 1)
         status, body = _send(opener, urllib.request.Request(base + path, headers={"Referer": base}))
         if status in (401, 403) and attempt == 0:
-            _sessions.pop((base, creds["username"]), None)
+            _sessions.pop((base, *_cred_id(creds)), None)
             continue  # the session expired: log in again once
         if status != 200:
             raise AppError(f"the app answered HTTP {status}")
         try:
             return json.loads(body)
-        except ValueError:
+        except (ValueError, RecursionError):
             raise AppError("the app's answer was not JSON")
 
 
@@ -258,28 +311,31 @@ PELICAN_PAGE = 100
 PELICAN_MAX_PAGES = 10
 PELICAN_MAX_STATE_CALLS = 100
 PELICAN_SIGNALS = ("start", "stop", "restart")
-PELICAN_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+PELICAN_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")  # \Z: "$" would let a trailing newline through
+PELICAN_FILES_DEADLINE = 20  # seconds for the whole walk of a server's files
 
 # The newest answer, shared by the Pelican panel and the container rows (which only read it):
-# {"at": time, "data": {"servers": {uuid: {"name", "connect", "state"}}, "state_error": str|None}}
-_pelican = {"at": 0.0, "data": None}
+# {"at": time, "data": {"servers": {uuid: {"name", "connect", "state"}}, "state_error": str|None},
+#  "bases": the addresses it came from, "gen": bumped by pelican_forget}
+_pelican = {"at": 0.0, "data": None, "bases": None, "gen": 0}
 _pelican_lock = threading.Lock()
 
 
-def pelican_cached(max_age=120):
+def pelican_cached(max_age=120, bases=None):
     """(age in seconds, servers dict) of the last good answer, or (None, {}) if there is none or
-    it is too old to show."""
+    it is too old to show. With `bases`, only an answer that came from those addresses counts."""
     with _pelican_lock:
-        at, data = _pelican["at"], _pelican["data"]
+        at, data, came_from = _pelican["at"], _pelican["data"], _pelican["bases"]
     age = time.time() - at
-    if not data or age > max_age:
+    if not data or age > max_age or (bases is not None and tuple(bases) != came_from):
         return None, {}
     return age, data["servers"]
 
 
 def pelican_forget():
+    """Drop the cached answer, and any refresh still running (it would put it back)."""
     with _pelican_lock:
-        _pelican.update(at=0.0, data=None)
+        _pelican.update(at=0.0, data=None, bases=None, gen=_pelican["gen"] + 1)
 
 
 def _pelican_pages(bases, key, path, params=None):
@@ -339,16 +395,20 @@ def _pelican_list(bases, creds):
             continue
         allocs = _allocations(a)
         alloc = primary(a, allocs)
-        out[uuid] = {"name": a.get("name") or uuid, "connect": _connect(alloc) if alloc else None, "disk_limit": _disk_limit(a)}
+        name = a.get("name")
+        out[uuid] = {"name": name if isinstance(name, str) and name else uuid, "connect": _connect(alloc) if alloc else None, "disk_limit": _disk_limit(a)}
     return out
 
 
+@_guard
 def pelican_servers(bases, creds):
     """{"servers": {uuid: {"name", "connect", "state"}}, "state_error": str|None}. `state` is
     Wings' own (offline, starting, running, stopping) and needs the client key; a server that
     key can't see just has no state. Raises AppError when the list itself can't be read."""
     if not (creds.get("application") or creds.get("client")):
         raise AppError("no Pelican key is stored")
+    with _pelican_lock:
+        gen = _pelican["gen"]
     servers = _pelican_list(bases, creds)
     state_error = None
     if creds.get("client"):
@@ -357,12 +417,14 @@ def pelican_servers(bases, creds):
         def state(uuid):
             try:
                 _, body = integrations.call(bases, _BEARER, f"Bearer {creds['client']}", f"/api/client/servers/{uuid}/resources")
+                attrs = (body.get("attributes") or {}) if isinstance(body, dict) else {}
+                value = attrs.get("current_state")
+                # bytes on disk, known whether or not the server is running
+                used = _number((attrs.get("resources") or {}).get("disk_bytes"))
             except AppError as e:
                 return None, None, str(e)
-            attrs = (body.get("attributes") or {}) if isinstance(body, dict) else {}
-            value = attrs.get("current_state")
-            # bytes on disk, known whether or not the server is running
-            used = _number((attrs.get("resources") or {}).get("disk_bytes"))
+            except _SHAPE_ERRORS:
+                return None, None, str(_shape_error())  # one odd answer is that server's problem, not the panel's
             return (value if isinstance(value, str) else None), (int(used) if used is not None else None), None
 
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -379,7 +441,8 @@ def pelican_servers(bases, creds):
         info.setdefault("disk_used", None)
     result = {"servers": servers, "state_error": state_error}
     with _pelican_lock:
-        _pelican.update(at=time.time(), data=result)
+        if _pelican["gen"] == gen:  # not if the key was removed while this was running
+            _pelican.update(at=time.time(), data=result, bases=tuple(bases))
     return result
 
 
@@ -410,7 +473,7 @@ def pelican_power(bases, creds, uuid, signal):
         headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "Content-Type": "application/json"},
         method="POST",
     )
-    status, _ = _send(urllib.request.build_opener(), req)
+    status, _ = _send(integrations.make_opener(), req)
     if status in (401, 403):
         raise AppError("Pelican refused: the user key can't control this server")
     if status == 404:
@@ -438,6 +501,7 @@ def _bearer_request(url, key, method="GET", data=None):
     return urllib.request.Request(url, data=data, headers=headers, method=method)
 
 
+@_guard
 def pelican_state(bases, creds, uuid):
     """Wings' own state for one server ("offline", "running", ...), or None if it isn't reported."""
     if not PELICAN_UUID.match(uuid):
@@ -455,13 +519,17 @@ def _list_dir(bases, creds, uuid, directory):
     return [r["attributes"] for r in data if isinstance(r, dict) and isinstance(r.get("attributes"), dict) and isinstance(r["attributes"].get("name"), str)]
 
 
+@_guard
 def pelican_files(bases, creds, uuid):
     """(files, truncated): config-looking files in a server's tree, each {"path", "size"}.
     Breadth first, bounded by depth and by the number of entries looked at."""
     if not PELICAN_UUID.match(uuid):
         raise AppError("not a Pelican server")
     found, seen, queue = [], 0, [("/", 0)]
+    deadline = time.monotonic() + PELICAN_FILES_DEADLINE
     while queue:
+        if time.monotonic() > deadline:
+            return found, True  # out of time: what was found so far, marked as cut short
         directory, depth = queue.pop(0)
         try:
             entries = _list_dir(bases, creds, uuid, directory)
@@ -500,7 +568,7 @@ def pelican_file_read(bases, creds, uuid, path):
         raise AppError("the panel doesn't list that file")
 
     def get(base):
-        status, body = _send(urllib.request.build_opener(), _bearer_request(_file_url(base, uuid, "contents", file=path), creds["client"]))
+        status, body = _send(integrations.make_opener(), _bearer_request(_file_url(base, uuid, "contents", file=path), creds["client"]))
         if status in (401, 403):
             raise AppError("Pelican refused: the user key can't read this server's files")
         if status != 200:
@@ -526,7 +594,7 @@ def pelican_file_write(bases, creds, uuid, path, text):
     if _listed(bases, creds, uuid, path) is None:
         raise AppError("the panel doesn't list that file")
     base, _ = integrations.call(bases, _BEARER, f"Bearer {creds['client']}", "/api/client", {"per_page": 1})
-    status, _ = _send(urllib.request.build_opener(), _bearer_request(_file_url(base, uuid, "write", file=path), creds["client"], "POST", data))
+    status, _ = _send(integrations.make_opener(), _bearer_request(_file_url(base, uuid, "write", file=path), creds["client"], "POST", data))
     if status in (401, 403):
         raise AppError("Pelican refused: the user key can't write this server's files")
     if status not in (200, 204):
@@ -549,12 +617,17 @@ def pelican_fetch(bases, spec, creds):
     panel = {"id": "servers", "title": "Game servers", "rows": rows, "total": len(servers), "power": bool(creds.get("client"))}
     if creds.get("client"):
         running = sum(1 for s in servers if s["state"] == "running")
-        panel["summary"] = f"{running} running" if not result["state_error"] else "state unavailable"
+        if result["state_error"]:
+            panel["summary"] = "state unavailable"
+        elif len(servers) > PELICAN_MAX_STATE_CALLS:
+            panel["summary"] = f"{running} running (of the first {PELICAN_MAX_STATE_CALLS})"  # only those were asked about
+        else:
+            panel["summary"] = f"{running} running"
     return [panel]
 
 
 HANDLERS = {
-    "seerr": Handler(check=None, fetch=seerr_fetch),
-    "qbittorrent": Handler(check=qbt_check, fetch=qbt_fetch),
-    "pelican": Handler(check=pelican_check, fetch=pelican_fetch),
+    "seerr": Handler(check=None, fetch=_guard(seerr_fetch)),
+    "qbittorrent": Handler(check=_guard_check(qbt_check), fetch=_guard(qbt_fetch)),
+    "pelican": Handler(check=_guard_check(pelican_check), fetch=_guard(pelican_fetch)),
 }

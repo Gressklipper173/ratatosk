@@ -1,0 +1,156 @@
+import { createRequire } from "node:module";
+import test from "node:test";
+import assert from "node:assert/strict";
+
+const E = createRequire(import.meta.url)("../../static/editlogic.js");
+
+// ---- restoreEol (a textarea turns every line break into "\n")
+
+test("a CRLF file edited in the textarea is saved with CRLF again", () => {
+  const original = "a=1\r\nb=2\r\n";
+  assert.equal(E.restoreEol(original, "a=1\nb=3\n"), "a=1\r\nb=3\r\n");
+  assert.equal(E.restoreEol(original, "a=1\nb=2\nc=3\n"), "a=1\r\nb=2\r\nc=3\r\n");
+});
+
+test("an unedited file comes back exactly, mixed endings included", () => {
+  const mixed = "a=1\r\nb=2\nc=3\r";
+  assert.equal(E.restoreEol(mixed, "a=1\nb=2\nc=3\n"), mixed);
+});
+
+test("an edited file with mixed endings gets the most common one throughout", () => {
+  assert.equal(E.restoreEol("a\r\nb\r\nc\n", "a\nb\nc\nd\n"), "a\r\nb\r\nc\r\nd\r\n");
+  assert.equal(E.restoreEol("a\nb\nc\r\n", "a\nb\nx\n"), "a\nb\nx\n");
+});
+
+test("lone CR files stay lone CR and LF files stay LF", () => {
+  assert.equal(E.restoreEol("a=1\rb=2\r", "a=9\nb=2\n"), "a=9\rb=2\r");
+  assert.equal(E.restoreEol("a=1\nb=2\n", "a=9\nb=2\n"), "a=9\nb=2\n");
+});
+
+test("a file without line breaks takes LF, and a stray CR in the edit is normalised", () => {
+  assert.equal(E.restoreEol("a=1", "a=1\nb=2"), "a=1\nb=2");
+  assert.equal(E.restoreEol("a=1\n", "a=1\r\nb=2\r"), "a=1\nb=2\n");
+});
+
+test("lineEnding breaks ties towards CRLF, then LF", () => {
+  assert.equal(E.lineEnding("a\r\nb\n"), "\r\n");
+  assert.equal(E.lineEnding("a\nb\rc"), "\n");
+  assert.equal(E.lineEnding(""), "\n");
+});
+
+// ---- groupNameProblem
+
+test("a group name over the server's limit is refused", () => {
+  assert.equal(E.MAX_GROUP_NAME, 64);
+  assert.equal(E.groupNameProblem("x".repeat(64), "Old", []), "");
+  assert.match(E.groupNameProblem("x".repeat(65), "Old", []), /at most 64/);
+  assert.equal(E.groupNameProblem("  " + "x".repeat(64) + "  ", "Old", []), ""); // trimmed first
+});
+
+test("a name already in use is refused, but keeping or clearing the name is not a problem", () => {
+  const taken = ["Ungrouped", "Media", "Old", "compose-project"];
+  assert.match(E.groupNameProblem("Media", "Old", taken), /already a group called "Media"/);
+  assert.match(E.groupNameProblem(" Ungrouped ", "Old", taken), /Ungrouped/);
+  assert.match(E.groupNameProblem("compose-project", "Old", taken), /compose-project/);
+  assert.equal(E.groupNameProblem("Old", "Old", taken), "");
+  assert.equal(E.groupNameProblem("   ", "Old", taken), "");
+  assert.equal(E.groupNameProblem("Fresh", "Old", taken), "");
+});
+
+// ---- coalesce (the save queue)
+
+const tick = () => new Promise((r) => setImmediate(r));
+
+function gated() {
+  const calls = [];
+  let active = 0;
+  let overlap = false;
+  const task = () => {
+    active++;
+    if (active > 1) overlap = true;
+    return new Promise((resolve) => {
+      calls.push(() => { active--; resolve(); });
+    });
+  };
+  return { calls, task, overlapped: () => overlap };
+}
+
+test("calls made while a run is in flight fold into one trailing run", async () => {
+  const g = gated();
+  const run = E.coalesce(g.task);
+  const first = run();
+  assert.equal(run.busy(), true);
+  run();
+  run();
+  run();
+  assert.equal(g.calls.length, 1);
+  g.calls.shift()();
+  await tick();
+  assert.equal(g.calls.length, 1); // one trailing run, not three
+  g.calls.shift()();
+  await first;
+  await tick();
+  assert.equal(g.calls.length, 0);
+  assert.equal(run.busy(), false);
+  assert.equal(g.overlapped(), false);
+});
+
+test("the trailing run sees the state as it is when it starts", async () => {
+  let state = 1;
+  const sent = [];
+  let release;
+  const run = E.coalesce(async () => {
+    sent.push(state);
+    await new Promise((r) => { release = r; });
+  });
+  run();
+  state = 2;
+  run();
+  state = 3;
+  run();
+  release();
+  await tick();
+  release();
+  await tick();
+  assert.deepEqual(sent, [1, 3]);
+});
+
+test("a call after the queue drained starts a fresh run", async () => {
+  let n = 0;
+  const run = E.coalesce(async () => { n++; });
+  await run();
+  await tick();
+  await run();
+  assert.equal(n, 2);
+  assert.equal(run.busy(), false);
+});
+
+test("a failing run does not wedge the queue or lose the trailing run", async () => {
+  const outcomes = [];
+  let fail = true;
+  let release;
+  const run = E.coalesce(async () => {
+    await new Promise((r) => { release = r; });
+    if (fail) { fail = false; throw new Error("boom"); }
+    outcomes.push("ok");
+  });
+  const first = run();
+  const caught = first.catch((e) => e.message);
+  run();
+  release();
+  assert.equal(await caught, "boom");
+  await tick();
+  release();
+  await tick();
+  assert.deepEqual(outcomes, ["ok"]);
+  assert.equal(run.busy(), false);
+});
+
+test("a task that throws at once still frees the queue", async () => {
+  let n = 0;
+  const run = E.coalesce(() => { n++; throw new Error("sync"); });
+  await assert.rejects(run(), /sync/);
+  assert.equal(run.busy(), false);
+  await assert.rejects(run(), /sync/);
+  assert.equal(n, 2);
+});

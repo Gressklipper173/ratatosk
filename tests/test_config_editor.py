@@ -266,6 +266,17 @@ def test_an_edit_that_would_break_the_file_is_refused(fs, logged_in):
     assert r.status_code == 400 and fs.posts == []
 
 
+@pytest.mark.parametrize("edit", [{"Crossplay": "(Steam)"}, {"ServerName": "Foo\\"}])
+def test_a_nested_edit_or_a_trailing_backslash_in_a_struct_is_refused(fs, logged_in, edit):
+    nested = 'OptionSettings=(ServerName="A",Crossplay=(Steam,Xbox))\n'
+    fs.tree["/.config"]["files"]["Game.ini"] = nested
+    c, csrf = logged_in
+    opened = open_file(c, U1, "/.config/Game.ini").get_json()
+    line = next(e for e in opened["entries"] if e["key"] == "OptionSettings")["line"]
+    r = save(c, csrf, U1, path="/.config/Game.ini", hash=opened["hash"], edits={str(line): edit})
+    assert r.status_code == 400 and r.get_json()["error"] and fs.posts == []
+
+
 def test_save_needs_csrf(fs, logged_in):
     c, csrf = logged_in
     r = c.put(url(U1, "config/file"), json={"path": "/.config/Game.ini", "hash": "x", "raw": "x"})

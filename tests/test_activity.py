@@ -1,8 +1,10 @@
+import io
 import json
+import time
 import urllib.error
 
 import pytest
-from conftest import FakeContainer
+from conftest import FakeContainer, post_login
 
 import activity
 import handlers
@@ -112,22 +114,37 @@ def test_python_logging_is_captured_and_redacted():
 class FakeResponse:
     def __init__(self, status=200, body=b"{}"):
         self.status = status
-        self._body = body
+        self._body = io.BytesIO(body)
+        self.closed = False
 
     def read(self, n=-1):
-        return self._body
+        return self._body.read(n)
 
     def __enter__(self):
         return self
 
     def __exit__(self, *a):
+        self.closed = True
         return False
 
 
+def fake_network(monkeypatch, fn):
+    """Every request the integrations make goes through make_opener(); `fn(req)` answers it
+    (a FakeResponse) or raises what urllib would."""
+
+    class Opener:
+        def open(self, req, timeout=None):
+            return fn(req)
+
+    monkeypatch.setattr(integrations, "make_opener", lambda *extra: Opener())
+
+
+def http_error(req, code):
+    return urllib.error.HTTPError(req.full_url, code, "x", {}, io.BytesIO(b""))
+
+
 def test_adapter_request_logs_status_and_time_but_not_key_or_body(monkeypatch):
-    monkeypatch.setattr(
-        integrations.urllib.request, "urlopen", lambda req, timeout=None: FakeResponse(200, b'{"token": "reply-body-marker"}')
-    )
+    fake_network(monkeypatch, lambda req: FakeResponse(200, b'{"token": "reply-body-marker"}'))
     activity.set_level("verbose")
     integrations.http_get_json("http://10.0.0.2:8989/api/v3/x?apikey=querymarker", "X-Api-Key", SECRET)
     text = everything()
@@ -137,20 +154,20 @@ def test_adapter_request_logs_status_and_time_but_not_key_or_body(monkeypatch):
 
 
 def test_unexpected_status_is_logged_at_normal_level(monkeypatch):
-    def boom(req, timeout=None):
-        raise urllib.error.HTTPError(req.full_url, 204, "No Content", {}, None)
+    def boom(req):
+        raise http_error(req, 500)
 
-    monkeypatch.setattr(integrations.urllib.request, "urlopen", boom)
+    fake_network(monkeypatch, boom)
     with pytest.raises(integrations.AppError):
         integrations.http_get_json("http://10.0.0.2:8989/x", "X-Api-Key", SECRET)
-    assert any("HTTP 204" in m for m in lines())
+    assert any("HTTP 500" in m for m in lines())
 
 
 def test_unreachable_is_only_a_verbose_line(monkeypatch):
-    def down(req, timeout=None):
+    def down(req):
         raise urllib.error.URLError(ConnectionRefusedError("refused"))
 
-    monkeypatch.setattr(integrations.urllib.request, "urlopen", down)
+    fake_network(monkeypatch, down)
     with pytest.raises(integrations.AppError):
         integrations.http_get_json("http://10.0.0.2:8989/x", "X-Api-Key", SECRET)
     assert lines() == []
@@ -253,8 +270,8 @@ def test_unhandled_error_is_logged_with_traceback_and_hides_details(env, logged_
 
 def test_sign_in_failures_and_successes_are_logged(env, logged_in):
     c = env.app.app.test_client()
-    c.post("/login", data={"username": "admin", "password": "wrong-password-marker"})
-    c.post("/login", data={"username": "admin", "password": "correct-horse"})
+    post_login(c, "admin", "wrong-password-marker")
+    post_login(c, "admin", "correct-horse")
     text = everything()
     assert "failed sign-in" in text and "admin signed in" in text
     assert "wrong-password-marker" not in text and "correct-horse" not in text
@@ -266,14 +283,14 @@ def test_storing_and_using_a_key_leaves_no_trace_of_it(env, logged_in, monkeypat
     c, csrf = logged_in
     env.client.add(FakeContainer("sonarr", image_ref="lscr.io/linuxserver/sonarr:latest"))
 
-    def fake_open(req, timeout=None):
+    def fake_open(req):
         if req.headers.get("X-api-key") != SECRET:
-            raise urllib.error.HTTPError(req.full_url, 401, "no", {}, None)
+            raise http_error(req, 401)
         if "/system/status" in req.full_url:
             return FakeResponse(200, b'{"appName": "Sonarr"}')
         return FakeResponse(200, b'{"totalRecords": 0, "records": []}')
 
-    monkeypatch.setattr(integrations.urllib.request, "urlopen", fake_open)
+    fake_network(monkeypatch, fake_open)
     activity.set_level("verbose")
     h = {"X-CSRF-Token": csrf}
     c.put("/api/integrations/sonarr/key", json={"key": "wrongkey999"}, headers=h)
@@ -283,3 +300,64 @@ def test_storing_and_using_a_key_leaves_no_trace_of_it(env, logged_in, monkeypat
     text = everything()
     assert "credentials for sonarr tested and stored" in text and "credentials for sonarr removed" in text
     assert SECRET not in text and "wrongkey999" not in text
+
+
+# ---- redaction, hardened ---------------------------------------------------------------
+
+def test_url_encoded_and_json_escaped_secrets_are_masked_too():
+    import json as _json
+    from urllib.parse import quote, quote_plus
+
+    secret = 's3cret pass&"x"/é'
+    activity.set_secret_source(lambda: (secret,))
+    for form in (secret, quote_plus(secret), quote(secret), _json.dumps(secret)[1:-1], _json.dumps(secret, ensure_ascii=False)[1:-1]):
+        assert activity.redact(f"a {form} b") == "a *** b"
+    activity.log("info", "t", "username=admin&password=" + quote_plus(secret))
+    assert "s3cret" not in everything()
+
+
+def test_a_secret_inside_another_does_not_leave_the_tail_of_the_longer_one():
+    for order in (("abcd", "abcdefgh"), ("abcdefgh", "abcd")):
+        activity.set_secret_source(lambda order=order: order)
+        assert activity.redact("x abcdefgh y") == "x *** y"
+
+
+def test_a_secret_source_that_fails_does_not_break_logging_and_keeps_the_last_known_secrets():
+    state = {"fail": False}
+
+    def source():
+        if state["fail"]:
+            raise OSError("unreadable store")
+        return ("hunter2-password",)
+
+    activity.set_secret_source(source)
+    activity.log("info", "t", "first")
+    state["fail"] = True
+    activity.log("info", "t", "again hunter2-password")  # must not raise
+    assert "hunter2-password" not in everything() and "again ***" in lines()[-1]
+    activity.set_secret_source(lambda: None)  # not even iterable
+    activity.log("info", "t", "still works")
+
+
+def test_stderr_gets_one_flat_line_per_entry(capsys):
+    activity.log("error", "adapter", "bad file\n[auth] info: admin signed in\r\x1b[2J")
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and "\x1b" not in err and "\r" not in err
+
+
+def test_snapshot_with_a_limit_of_zero_is_empty():
+    activity.log("info", "t", "one")
+    assert activity.snapshot(limit=0)[0] == []
+    assert len(activity.snapshot(limit=1)[0]) == 1
+
+
+def test_a_boolean_total_is_not_a_count():
+    panel = {"id": "p", "title": "P", "rows": "data", "row_title": "{n}", "total": "n"}
+    assert integrations.build_panel(panel, {"data": [{}, {}], "n": True})["total"] == 2
+    assert integrations.build_panel(panel, {"data": [{}, {}], "n": 9})["total"] == 9
+
+
+def test_a_boolean_total_from_seerr_is_not_a_count(monkeypatch):
+    monkeypatch.setattr(integrations, "http_get_json", lambda *a, **k: {"results": [], "pageInfo": {"results": True}})
+    panels = handlers.seerr_fetch(["http://s:1"], {"auth": {"header": "X-Api-Key"}}, "k")
+    assert [p["total"] for p in panels] == [0, 0]

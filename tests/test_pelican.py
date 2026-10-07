@@ -485,3 +485,83 @@ def test_the_panel_shows_the_new_state_right_after_a_power_action(env, logged_in
 def test_only_the_user_key_is_marked_sufficient(env):
     keys = {k["id"]: k["sufficient"] for k in env.app.ADAPTERS["pelican"]["auth"]["keys"]}
     assert keys == {"application": False, "client": True}
+
+
+# ---- hardening: ids, stale refreshes, odd answers ------------------------------------------
+
+BASES = ["http://172.20.0.5:80"]
+
+
+@pytest.mark.parametrize("bad", [U1 + "\n", U1 + " ", "\n" + U1, U1.upper(), U1[:-1]])
+def test_a_uuid_with_anything_extra_is_refused(bad):
+    assert handlers.PELICAN_UUID.match(U1) and not handlers.PELICAN_UUID.match(bad)
+    creds = {"client": CLIENT}
+    with pytest.raises(integrations.AppError, match="not a Pelican server"):
+        handlers.pelican_state(BASES, creds, bad)
+    with pytest.raises(integrations.AppError, match="not a Pelican server"):
+        handlers.pelican_files(BASES, creds, bad)
+    with pytest.raises(integrations.AppError, match="not a power action"):
+        handlers.pelican_power(BASES, creds, bad, "stop")
+
+
+def test_a_refresh_that_was_running_when_the_key_was_removed_does_not_bring_the_names_back(pel, monkeypatch):
+    def get(url, header, key, timeout=5):
+        if "/resources" in url:
+            handlers.pelican_forget()  # the admin removes the key while the state calls are in flight
+        return pel.get(url, header, key, timeout)
+
+    monkeypatch.setattr(integrations, "http_get_json", get)
+    result = handlers.pelican_servers(BASES, {"application": ADMIN, "client": CLIENT})
+    assert U1 in result["servers"]  # the caller still gets its answer
+    assert handlers.pelican_cached() == (None, {})
+
+
+def test_the_cache_only_answers_for_the_addresses_it_came_from(pel):
+    handlers.pelican_servers(BASES, {"application": ADMIN})
+    assert handlers.pelican_cached()[1] and handlers.pelican_cached(bases=BASES)[1]
+    assert handlers.pelican_cached(bases=["http://172.20.0.99:80"]) == (None, {})
+
+
+def test_a_server_name_that_is_not_text_does_not_break_the_panel(env, monkeypatch):
+    rows = [{"attributes": {"uuid": U1, "name": 5}}, {"attributes": {"uuid": U2, "name": ["x"]}}]
+    monkeypatch.setattr(integrations, "http_get_json", lambda *a, **k: {"data": rows})
+    [panel] = handlers.HANDLERS["pelican"].fetch(BASES, {}, {"application": ADMIN})
+    assert [r["title"] for r in panel["rows"]] == [U1, U2]
+
+
+def test_one_odd_state_answer_is_that_servers_problem_not_the_panels(pel, monkeypatch):
+    def get(url, header, key, timeout=5):
+        if U2 in url and "/resources" in url:
+            return {"attributes": ["not", "a", "dict"]}
+        return pel.get(url, header, key, timeout)
+
+    monkeypatch.setattr(integrations, "http_get_json", get)
+    result = handlers.pelican_servers(BASES, {"application": ADMIN, "client": CLIENT})
+    assert result["servers"][U1]["state"] == "running" and result["servers"][U2]["state"] is None
+    assert result["state_error"] is None  # only one of the two failed
+
+
+def test_a_wrongly_shaped_panel_answer_is_an_app_error(monkeypatch):
+    monkeypatch.setattr(integrations, "http_get_json", lambda *a, **k: {"data": [{"attributes": {"uuid": U1, "limits": 5}}]})
+    with pytest.raises(integrations.AppError):
+        handlers.HANDLERS["pelican"].fetch(BASES, {}, {"application": ADMIN})
+
+
+def test_the_running_count_says_when_it_covers_only_part_of_the_servers(monkeypatch):
+    def servers(n):
+        return {"servers": {f"{i:08x}-0000-0000-0000-000000000000": {"name": f"s{i}", "connect": None, "state": "running", "disk_used": None, "disk_limit": None}
+                            for i in range(n)}, "state_error": None}
+
+    monkeypatch.setattr(handlers, "pelican_servers", lambda b, c: servers(3))
+    assert handlers.pelican_fetch(BASES, {}, {"client": CLIENT})[0]["summary"] == "3 running"
+    monkeypatch.setattr(handlers, "pelican_servers", lambda b, c: servers(handlers.PELICAN_MAX_STATE_CALLS + 1))
+    # only the first 100 are asked about in real life, so a count over more servers is marked as partial
+    assert handlers.pelican_fetch(BASES, {}, {"client": CLIENT})[0]["summary"] == "101 running (of the first 100)"
+
+
+def test_walking_a_servers_files_stops_at_its_deadline(monkeypatch):
+    asked = []
+    monkeypatch.setattr(handlers, "_list_dir", lambda *a: asked.append(a) or [])
+    monkeypatch.setattr(handlers, "PELICAN_FILES_DEADLINE", -1)
+    assert handlers.pelican_files(BASES, {"client": CLIENT}, U1) == ([], True)
+    assert asked == []

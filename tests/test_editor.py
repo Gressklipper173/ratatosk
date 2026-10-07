@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 import editor
@@ -71,12 +73,19 @@ def test_render_struct_edits_one_setting_and_keeps_the_rest_and_crlf():
     assert out.count("\r\n") == 2
 
 
-def test_render_struct_never_rewrites_nested_values_or_unknown_names():
+def test_render_struct_ignores_unknown_names_and_refuses_nested_edits():
     line = by_key(editor.parse(PALWORLD))["OptionSettings"]["line"]
-    assert editor.render(PALWORLD, "keyvalue", {str(line): {"Crossplay": "()", "Nope": "1"}}) == PALWORLD
+    assert editor.render(PALWORLD, "keyvalue", {str(line): {"Nope": "1"}}) == PALWORLD
+    with pytest.raises(editor.EditError):  # the form shows nested parts read-only; an edit would be dropped silently
+        editor.render(PALWORLD, "keyvalue", {str(line): {"Crossplay": "()"}})
 
 
-@pytest.mark.parametrize("edit", [{"ExpRate": "1,Evil=2"}, {"ExpRate": "(x)"}, {"ServerName": 'a"b'}, {"ExpRate": "1\nX=1"}])
+@pytest.mark.parametrize("edit", [
+    {"ExpRate": "1,Evil=2"}, {"ExpRate": "(x)"}, {"ServerName": 'a"b'}, {"ExpRate": "1\nX=1"},
+    {"ServerName": 'a\\\\"b'},  # `a\\"b`: the quote is not escaped, the backslashes escape each other
+    {"ServerName": "Foo\\"},  # would escape the closing quote
+    {"ExpRate": "1\x0b2"}, {"ExpRate": "1\u20282"}, {"ExpRate": "1\x85"}, {"ExpRate": "1\n"},
+])
 def test_render_struct_refuses_values_that_would_break_the_line(edit):
     line = by_key(editor.parse(PALWORLD))["OptionSettings"]["line"]
     with pytest.raises(editor.EditError):
@@ -188,3 +197,79 @@ def test_the_header_is_not_repeated_as_the_first_settings_comment():
     glued = editor.parse("; about\nx=1\n")  # no blank line or section: it is the header only
     assert glued["header"] == ["about"] and "comment" not in glued["entries"][0]
     assert editor.render(COMMENTED, "keyvalue", {}) == COMMENTED
+
+
+# ---- regressions from the code review ------------------------------------------------------
+
+def test_a_lone_cr_file_round_trips_without_fusing_lines():
+    text = "a=1\rb=2\rc=3\r"
+    entries = by_key(editor.parse(text))
+    assert [entries[k]["line"] for k in "abc"] == [0, 1, 2]
+    assert editor.render(text, "keyvalue", {"0": "9"}) == "a=9\rb=2\rc=3\r"
+    assert editor.render(text, "keyvalue", {"2": "7"}) == "a=1\rb=2\rc=7\r"
+    assert editor.render(text, "keyvalue", {}) == text
+
+
+def test_only_lf_crlf_and_cr_end_a_line():
+    text = "a=1\x0cb=2\u2028c\n"  # a form feed and a line separator are part of the value
+    parsed = editor.parse(text)
+    assert [e["key"] for e in parsed["entries"]] == ["a"]
+    assert editor.render(text, "keyvalue", {"0": "9"}) == "a=9\n"
+    assert editor.render("a=1\r\nb=2\nc=3\r", "keyvalue", {"0": "x", "1": "y", "2": "z"}) == "a=x\r\nb=y\nc=z\r"
+
+
+def test_a_list_with_cr_endings_keeps_them():
+    text = "// admins\r1\r2\r"
+    assert editor.parse(text)["format"] == "list"
+    assert editor.render(text, "list", {"entries": ["1", "3"]}) == "// admins\r1\r3\r"
+    assert editor.render(text, "list", {"entries": ["1", "2", "3"]}) == "// admins\r1\r2\r3\n"
+
+
+STRUCT = 'OptionSettings=(A="Foo",B=1,Path="C:\\\\",C="x")\n'
+
+
+def test_a_quoted_value_ending_in_a_double_backslash_parses_and_survives_an_edit():
+    fields = {f["key"]: f["value"] for f in by_key(editor.parse(STRUCT))["OptionSettings"]["fields"]}
+    assert fields == {"A": "Foo", "B": "1", "Path": "C:\\\\", "C": "x"}  # the closing quote is found, C is not swallowed
+    out = editor.render(STRUCT, "keyvalue", {"0": {"B": "2"}})
+    assert out == STRUCT.replace("B=1", "B=2")
+    out = editor.render(STRUCT, "keyvalue", {"0": {"Path": "D:\\\\"}})  # an even run is fine
+    assert out == STRUCT.replace("C:", "D:")
+
+
+def test_an_escaped_quote_inside_a_struct_value_does_not_end_it():
+    line = 'S=(A="say \\"hi\\", ok",B=1)\n'
+    fields = {f["key"]: f["value"] for f in by_key(editor.parse(line))["S"]["fields"]}
+    assert fields == {"A": 'say \\"hi\\", ok', "B": "1"}
+
+
+def test_a_trailing_odd_backslash_is_refused_so_the_closing_quote_survives():
+    with pytest.raises(editor.EditError):
+        editor.render(STRUCT, "keyvalue", {"0": {"A": "Foo\\"}})
+    # and the same text written with an even run keeps the struct intact
+    out = editor.render(STRUCT, "keyvalue", {"0": {"A": "Foo\\\\"}})
+    assert [f["value"] for f in by_key(editor.parse(out))["OptionSettings"]["fields"]] == ["Foo\\\\", "1", "C:\\\\", "x"]
+
+
+def test_list_entries_that_would_read_as_comments_are_refused():
+    for bad in ("# note", "; note", "//host", "  # padded"):
+        with pytest.raises(editor.EditError):
+            editor.render(LIST, "list", {"entries": ["76561190000000001", bad]})
+    assert editor.render(LIST, "list", {"entries": ["a#b"]}) == "// admins\na#b\n\n"
+
+
+def test_a_long_whitespace_line_is_handled_in_linear_time():
+    started = time.monotonic()
+    for pad in (40_000, 10_000):  # over the line limit, and just under it
+        text = "k=a" + " " * pad + "b\nj=1\n"
+        parsed = editor.parse(text)
+        assert editor.parse(text)["format"] in ("keyvalue", "list")
+        if pad < editor.MAX_LINE:
+            assert by_key(parsed)["k"]["value"] == "a" + " " * pad + "b"
+            assert editor.render(text, "keyvalue", {"1": "2"}) == text.replace("j=1", "j=2")
+        else:  # skipped by parse, refused by render
+            assert [e["key"] for e in parsed["entries"]] == ["j"]
+            with pytest.raises(editor.EditError):
+                editor.render(text, "keyvalue", {"1": "2"})
+    assert editor.parse("k=a" + " " * 100_000 + "\n")["entries"] == []
+    assert time.monotonic() - started < 2

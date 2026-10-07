@@ -1,0 +1,41 @@
+# Changelog
+
+All notable changes are listed here. Versions follow [semantic versioning](https://semver.org/).
+
+## 0.1.0 (unreleased)
+
+First public version.
+
+- Lists every container with state, health, ports, CPU and memory; start, stop, restart and delete
+  stopped containers, update a Compose container's image, and read its logs.
+- Groups with priorities, drag-and-drop panels per screen width, link tiles and a host panel with
+  storage meters.
+- App panels through adapters (Sonarr, Radarr, Seerr, qBittorrent, Pelican) and your own in `/data/adapters`.
+- Users with admin and operator roles; changing or resetting a password signs out that account's other sessions.
+- Debug panel, `READ_ONLY` mode, `BEHIND_PROXY` mode, `/healthz` and a Docker `HEALTHCHECK`.
+- Container labels `ratatosk.name`, `ratatosk.url`, `ratatosk.hide` and `ratatosk.adapter` (the older
+  `dashboard.*` names still work).
+- Security hardening from a code review:
+  - `PROXY_IP_HEADER` (`xff` by default, or `cf` for Cloudflare) picks the one header trusted for the
+    visitor's address behind `BEHIND_PROXY`, so a forged header no longer gets past the login throttle.
+  - Requests to apps never follow redirects or use a proxy from the environment, so a stored key is
+    not re-sent elsewhere, and a slow, malformed or oversized answer is an error for that one panel.
+  - Content-Security-Policy, `X-Frame-Options`, `X-Content-Type-Options` and `Cache-Control: no-store`
+    on pages and API answers.
+  - Sessions last 12 hours; signing out is a POST with a CSRF token; the sign-in and setup forms carry
+    one too; unknown user names take as long to check as wrong passwords.
+  - The Debug log and container updates are admin-only. Operators can still edit game-server config files.
+  - A damaged `users.json` stops start-up (503 while running) instead of re-opening `/setup`.
+  - Writes to the users and keys files are serialised and use a unique temporary file.
+  - Dependencies are locked with hashes (`requirements.in` → `requirements.txt`, Flask 3.1.3 and
+    gunicorn 23.0.0) and the base images are pinned by digest.
+- `/healthz` also asks Docker and answers 503 when the socket is missing or unusable.
+- The example compose file publishes `127.0.0.1:8090` only and sets `no-new-privileges`.
+- qBittorrent: a rejected login is not retried for about five minutes, to stay clear of its IP ban.
+- Adapters: a file that is not UTF-8 or is over 64 KB is skipped and reported instead of stopping the
+  app; `key_file` is stricter (one named file, 64 KB searched, no nested repeats).
+- Fixes: hiding the Host panel no longer breaks container refreshes; action buttons re-enable after a
+  failed action or a restart; the config editor keeps line endings, rejects values that would corrupt
+  a file, and raw mode keeps CRLF files as they were.
+- Docs: `READ_ONLY`, the `Secure` cookie, adapter trust, the socket-proxy advice and the `DISABLE_SAMPLER`
+  and `HOSTNAME` variables are described as they behave.

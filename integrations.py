@@ -5,6 +5,7 @@ in. Nothing here runs a spec's contents; the only thing a spec can make this mod
 GET paths on the app's own API, with a key the admin approved. See docs/ADAPTERS.md.
 """
 
+import http.client
 import io
 import json
 import os
@@ -13,16 +14,20 @@ import tarfile
 import urllib.error
 import time
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
 from urllib.parse import urlencode
 
 import yaml
 
 import activity
 
-REQUEST_TIMEOUT = 5
+REQUEST_TIMEOUT = 5  # per socket operation
+REQUEST_DEADLINE = 15  # for a whole answer: a server dripping one byte at a time can't hold a thread
+FIRST_OK_TIMEOUT = 30  # for every address of one call together
 MAX_KEY_FILE = 1024 * 1024
+MAX_KEY_SCAN = 64 * 1024  # how much of the key file a regex is run over
 MAX_RESPONSE = 4 * 1024 * 1024
+MAX_ADAPTER_FILE = 64 * 1024
 MAX_ROWS = 50
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -32,6 +37,37 @@ TEMPLATE_RE = re.compile(r"\{([A-Za-z0-9_.]+)\}")
 
 class SpecError(ValueError):
     pass
+
+
+def has_nested_repeat(regex):
+    """True if a group that holds a repeat is itself repeated, e.g. (a+)+ or (?:a|b*){2,}: the
+    classic way to make a pattern take exponential time. A rough check, not a proof; the text
+    a pattern is run over is capped too."""
+    stack, i = [False], 0  # per open group: does it hold a repeat?
+    while i < len(regex):
+        ch = regex[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "[":  # a character class: nothing inside it repeats
+            i += 2 if regex[i + 1:i + 2] == "^" else 1
+            i += 1  # a "]" right at the start is a literal
+            while i < len(regex) and regex[i] != "]":
+                i += 2 if regex[i] == "\\" else 1
+        elif ch == "(":
+            stack.append(False)
+        elif ch == ")" and len(stack) > 1:
+            held = stack.pop()
+            nxt = regex[i + 1:i + 2]
+            if nxt in ("+", "*") or (nxt == "{" and re.match(r"\{\d*,\d*\}", regex[i + 1:])):
+                if held:
+                    return True
+                held = True
+            stack[-1] = stack[-1] or held
+        elif ch in "+*" or (ch == "{" and re.match(r"\{\d*,\d*\}", regex[i:])):
+            stack[-1] = True
+        i += 1
+    return False
 
 
 def _need(cond, msg):
@@ -44,9 +80,12 @@ def _text(v, field, limit=200):
     return v
 
 
-def _path(v, field):
+def _path(v, field, url=True):
+    """`url` paths are put into a request, so they may not hold spaces either; a key_file
+    path is only a file name inside the container."""
     _text(v, field)
     _need(v.startswith("/") and "://" not in v and ".." not in v.split("/"), f"{field} must be a path starting with /")
+    _need(not re.search(r"[\x00-\x1f\x7f]", v) and not (url and re.search(r"\s", v)), f"{field} must not contain spaces or control characters")
     return v
 
 
@@ -110,7 +149,7 @@ def validate_spec(data, trusted=False, handlers=None):
         _need(isinstance(key_file, dict), "key_file must be a mapping")
         regex, json_path = key_file.get("regex"), key_file.get("json_path")
         _need((regex is None) != (json_path is None), "key_file needs exactly one of regex or json_path")
-        out["key_file"] = {"path": _path(key_file.get("path"), "key_file.path")}
+        out["key_file"] = {"path": _path(key_file.get("path"), "key_file.path", url=False)}
         if regex is not None:
             _text(regex, "key_file.regex", 200)
             try:
@@ -118,6 +157,7 @@ def validate_spec(data, trusted=False, handlers=None):
             except re.error as e:
                 raise SpecError(f"key_file.regex is not a valid pattern: {e}")
             _need(compiled.groups == 1, "key_file.regex needs exactly one (capture group) around the key")
+            _need(not has_nested_repeat(regex), "key_file.regex may not repeat a group that is itself repeated, like (a+)+")
             out["key_file"]["regex"] = regex
         else:
             _text(json_path, "key_file.json_path", 100)
@@ -168,9 +208,13 @@ def load_adapters(*dirs, trusted=(), handlers=None):
             continue
         for n in names:
             try:
-                with open(os.path.join(d, n)) as f:
-                    spec = validate_spec(yaml.safe_load(f), trusted=d in trusted, handlers=handlers)
-            except (OSError, yaml.YAMLError, SpecError) as e:
+                with open(os.path.join(d, n), encoding="utf-8") as f:
+                    text = f.read(MAX_ADAPTER_FILE + 1)
+                if len(text) > MAX_ADAPTER_FILE:
+                    raise SpecError(f"the file is over {MAX_ADAPTER_FILE // 1024} KB")
+                spec = validate_spec(yaml.safe_load(text), trusted=d in trusted, handlers=handlers)
+            # ValueError covers SpecError and a file that is not UTF-8; deep nesting is a RecursionError
+            except (OSError, yaml.YAMLError, ValueError, RecursionError) as e:
                 problems.append(f"{n}: {e}")
                 continue
             adapters[spec["id"]] = spec
@@ -193,10 +237,15 @@ def image_repo(ref):
     return (head + "/" if head else "") + last.split(":")[0].lower()
 
 
+def label(labels, key):
+    """A Ratatosk container label: `ratatosk.<key>`, else the older `dashboard.<key>`, else ""."""
+    return str(labels.get("ratatosk." + key) or labels.get("dashboard." + key) or "")
+
+
 def match_adapter(adapters, labels, image_ref):
-    """The adapter for a container, or None. The `dashboard.adapter` label wins:
-    an adapter id picks it, `none` switches the notice off."""
-    wanted = str(labels.get("dashboard.adapter", "")).strip().lower()
+    """The adapter for a container, or None. The `ratatosk.adapter` label (or the older
+    `dashboard.adapter`) wins: an adapter id picks it, `none` switches the notice off."""
+    wanted = label(labels, "adapter").strip().lower()
     if wanted == "none":
         return None
     if wanted:
@@ -230,37 +279,82 @@ class AppError(Exception):
     """An app call failed; the message is safe to show (it never contains the key)."""
 
 
-def http_get_json(url, header, key, timeout=REQUEST_TIMEOUT):
-    where = activity.safe_url(url)
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is an error, never followed: the request carries a key, and the address came from
+    the container, so it must not be sent anywhere else."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def make_opener(*extra):
+    """The one way requests to apps are made: no redirects, and never through a proxy from the
+    environment (it would see the key). `extra` are further handlers, e.g. a cookie processor."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect(), *extra)
+
+
+def _read_body(resp, deadline):
+    """The whole body, read in chunks so the total time and size can be held to a limit.
+    Raises AppError past either."""
+    read = getattr(resp, "read1", resp.read)  # read1 returns what has arrived instead of waiting for a full chunk
+    chunks, size = [], 0
+    while True:
+        if time.monotonic() > deadline:
+            raise AppError("the app took too long to answer")
+        chunk = read(65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > MAX_RESPONSE:
+            raise AppError("the app's answer was too large")
+
+
+def _open(req, opener=None, timeout=REQUEST_TIMEOUT):
+    """(status, body) for one request. An HTTP error status is returned like any other, with an
+    empty body; anything else that goes wrong (no answer, a malformed one, too slow, too big)
+    raises AppError. Every request to an app goes through here."""
+    where = f"{req.get_method()} {activity.safe_url(req.full_url)}"
     started = time.monotonic()
 
     def took():
         return f"{int((time.monotonic() - started) * 1000)} ms"
 
-    req = urllib.request.Request(url, headers={header: key, "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            status = r.status
-            body = r.read(MAX_RESPONSE + 1)
-    except urllib.error.HTTPError as e:
-        activity.log("warn", "adapter", f"GET {where} -> HTTP {e.code} ({took()})")
-        if e.code in (401, 403):
-            raise AppError("the app rejected the key")
-        raise AppError(f"the app answered HTTP {e.code}")
-    except (urllib.error.URLError, OSError) as e:
+        try:
+            resp = (opener or make_opener()).open(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            e.close()
+            activity.log("warn", "adapter", f"{where} -> HTTP {e.code} ({took()})")
+            return e.code, b""
+        with resp:
+            status = resp.status
+            body = _read_body(resp, started + REQUEST_DEADLINE)
+    except AppError as e:
+        activity.log("warn", "adapter", f"{where} -> {e} ({took()})")
+        raise
+    # a malformed answer (BadStatusLine, IncompleteRead), a bad address (InvalidURL) or a header
+    # that can't be encoded must not escape as a 500 for everyone's panels
+    except (OSError, http.client.HTTPException, ValueError, RecursionError) as e:
         reason = getattr(e, "reason", e)
-        activity.log("info", "adapter", f"GET {where} -> no answer: {type(reason).__name__} ({took()})", verbose=True)
+        activity.log("info", "adapter", f"{where} -> no answer: {type(reason).__name__} ({took()})", verbose=True)
         raise AppError("could not reach the app")
-    if len(body) > MAX_RESPONSE:
-        activity.log("warn", "adapter", f"GET {where} -> HTTP {status}, answer over {MAX_RESPONSE} bytes ({took()})")
-        raise AppError("the app's answer was too large")
+    activity.log("info", "adapter", f"{where} -> HTTP {status}, {len(body)} bytes ({took()})", verbose=True)
+    return status, body
+
+
+def http_get_json(url, header, key, timeout=REQUEST_TIMEOUT):
+    req = urllib.request.Request(url, headers={header: key, "Accept": "application/json"})
+    status, body = _open(req, timeout=timeout)
+    if status >= 300:  # includes a redirect, which is never followed
+        if status in (401, 403):
+            raise AppError("the app rejected the key")
+        raise AppError(f"the app answered HTTP {status}")
     try:
-        data = json.loads(body)
-    except ValueError:
-        activity.log("warn", "adapter", f"GET {where} -> HTTP {status}, {len(body)} bytes that are not JSON ({took()})")
+        return json.loads(body)
+    except (ValueError, RecursionError):
+        activity.log("warn", "adapter", f"GET {activity.safe_url(url)} -> HTTP {status}, {len(body)} bytes that are not JSON")
         raise AppError("the app's answer was not JSON")
-    activity.log("info", "adapter", f"GET {where} -> HTTP {status}, {len(body)} bytes ({took()})", verbose=True)
-    return data
 
 
 REJECTED = ("the app rejected the key", "the app rejected the login")
@@ -277,14 +371,17 @@ def first_ok(bases, fn):
     pool = ThreadPoolExecutor(max_workers=len(bases))
     try:
         futures = [pool.submit(lambda b=b: (b, fn(b))) for b in bases]
-        for f in as_completed(futures):
-            try:
-                return f.result()
-            except AppError as e:
-                if str(e) in REJECTED:
-                    raise  # reached it; a different address would not change the answer
-                if str(error) == "could not reach the app":
-                    error = e
+        try:
+            for f in as_completed(futures, timeout=FIRST_OK_TIMEOUT):
+                try:
+                    return f.result()
+                except AppError as e:
+                    if str(e) in REJECTED:
+                        raise  # reached it; a different address would not change the answer
+                    if str(error) == "could not reach the app":
+                        error = e
+        except FuturesTimeout:
+            error = AppError("the app took too long to answer")
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     activity.log("warn", "adapter", f"none of {len(bases)} address(es) worked: {error}")
@@ -311,17 +408,24 @@ def test_key(bases, spec, key):
 def key_from_archive(chunks, key_file):
     """The key found in the single file of a `get_archive` tar stream, or None. `key_file`
     is the adapter's key_file mapping: a `regex` with one group, or a `json_path`."""
-    data = b""
-    for chunk in chunks:
-        data += chunk
-        if len(data) > MAX_KEY_FILE * 2:
-            return None
+    parts, size = [], 0
     try:
-        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
-            member = next((m for m in tar.getmembers() if m.isfile()), None)
-            if member is None or member.size > MAX_KEY_FILE:
+        for chunk in chunks:
+            parts.append(chunk)
+            size += len(chunk)
+            if size > MAX_KEY_FILE * 2:
                 return None
-            text = tar.extractfile(member).read().decode("utf-8", errors="replace")
+    finally:
+        close = getattr(chunks, "close", None)  # don't leave the Docker stream open on an early return
+        if close:
+            close()
+    try:
+        with tarfile.open(fileobj=io.BytesIO(b"".join(parts))) as tar:
+            files = [m for m in tar.getmembers() if m.isfile()]
+            # the one file asked for: a path that is a directory would otherwise give its first file
+            if len(files) != 1 or files[0].name != os.path.basename(key_file["path"]) or files[0].size > MAX_KEY_FILE:
+                return None
+            text = tar.extractfile(files[0]).read().decode("utf-8", errors="replace")
     except tarfile.TarError:
         return None
     if "json_path" in key_file:
@@ -330,8 +434,9 @@ def key_from_archive(chunks, key_file):
         except ValueError:
             return None
         return found.strip() if isinstance(found, str) and found.strip() else None
-    m = re.search(key_file["regex"], text)
-    return m.group(1).strip() if m and m.group(1).strip() else None
+    m = re.search(key_file["regex"], text[:MAX_KEY_SCAN])
+    found = m.group(1) if m else None  # None when the group did not take part, e.g. (x)?abc
+    return found.strip() if found and found.strip() else None
 
 
 # ---- turning an app's answer into panel rows ---------------------------------
@@ -368,5 +473,5 @@ def build_panel(panel, data):
         "id": panel["id"],
         "title": panel["title"],
         "rows": out,
-        "total": total if isinstance(total, int) else len(rows),
+        "total": total if isinstance(total, int) and not isinstance(total, bool) else len(rows),
     }

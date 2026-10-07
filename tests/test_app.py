@@ -1,16 +1,22 @@
-import re
+import importlib
 import json
+import os
+import re
+import stat
+import sys
 from types import SimpleNamespace
 
 import pytest
-from conftest import FakeContainer
+from conftest import FakeContainer, form_csrf, post_login
+
+import activity
 
 # ---- setup and login ----------------------------------------------------
 
 
 def test_setup_requires_token(env):
     c = env.app.app.test_client()
-    r = c.post("/setup", data={"token": "wrong", "username": "a", "password": "longenough1"})
+    r = c.post("/setup", data={"token": "wrong", "username": "a", "password": "longenough1", "csrf_token": form_csrf(c, "/setup")})
     assert r.status_code == 200
     assert b"Invalid setup token" in r.data
     assert env.app.load_users() == {}
@@ -18,7 +24,7 @@ def test_setup_requires_token(env):
 
 def test_setup_rejects_short_password(env):
     c = env.app.app.test_client()
-    r = c.post("/setup", data={"token": env.app.setup_token, "username": "a", "password": "short"})
+    r = c.post("/setup", data={"token": env.app.setup_token, "username": "a", "password": "short", "csrf_token": form_csrf(c, "/setup")})
     assert b"at least 8" in r.data
 
 
@@ -39,13 +45,13 @@ def test_unauthenticated_requests_redirect(env, logged_in):
 
 def test_login_throttles_after_repeated_failures(env, logged_in):
     c = env.app.app.test_client()
-    codes = [c.post("/login", data={"username": "admin", "password": "bad"}).status_code for _ in range(6)]
+    codes = [post_login(c, "admin", "bad").status_code for _ in range(6)]
     assert codes == [401] * 5 + [429]
 
 
 def test_login_works_with_right_password(env, logged_in):
     c = env.app.app.test_client()
-    assert c.post("/login", data={"username": "admin", "password": "correct-horse"}).status_code == 302
+    assert post_login(c, "admin", "correct-horse").status_code == 302
 
 
 # ---- container actions --------------------------------------------------
@@ -89,6 +95,26 @@ def test_read_only_blocks_actions(env, logged_in, monkeypatch):
     monkeypatch.setattr(env.app, "READ_ONLY", True)
     assert c.post("/api/containers/web/stop", headers={"X-CSRF-Token": csrf}).status_code == 403
     assert web.calls == []
+
+
+# ---- health check and version -------------------------------------------
+
+
+def test_healthz_needs_no_sign_in_and_says_nothing_else(env):
+    r = env.app.app.test_client().get("/healthz")
+    assert r.status_code == 200 and r.get_json() == {"ok": True}
+
+
+def test_healthz_works_before_the_first_account_exists(env):
+    assert env.app.setup_token is not None
+    assert env.app.app.test_client().get("/healthz").status_code == 200
+
+
+def test_the_version_is_shown_to_signed_in_users(env, logged_in):
+    c, _ = logged_in
+    version = open(env.app.os.path.join(env.app.os.path.dirname(env.app.__file__), "VERSION")).read().strip()
+    assert version and c.get("/api/containers").get_json()["version"] == version
+    assert f"Ratatosk {version}." in c.get("/").get_data(as_text=True)
 
 
 # ---- deleting a stopped container ---------------------------------------
@@ -519,6 +545,16 @@ def test_dashboard_hide_label_removes_the_link(env, logged_in):
     assert link_of(env, c, labels={"dashboard.hide": "true"}, ports=tcp(8080)) is None
 
 
+def test_ratatosk_labels_work_and_win_over_the_older_prefix(env, logged_in):
+    c, _ = logged_in
+    both = {"ratatosk.url": "https://new.example.com/", "dashboard.url": "https://old.example.com/"}
+    assert link_of(env, c, labels=both, ports=tcp(8080))["url"] == "https://new.example.com/"
+    assert link_of(env, c, labels={"ratatosk.hide": "true"}, ports=tcp(8080)) is None
+    env.client.add(FakeContainer("abc123", labels={"ratatosk.name": "New", "dashboard.name": "Old"}))
+    by = {i["name"]: i for i in c.get("/api/containers").get_json()["items"]}
+    assert by["abc123"]["label_name"] == "New"
+
+
 def test_dashboard_name_label_is_listed(env, logged_in):
     c, _ = logged_in
     env.client.add(FakeContainer("abc123", labels={"dashboard.name": "Sonarr"}))
@@ -771,7 +807,7 @@ def test_group_by_project_must_be_a_boolean(env, logged_in, value):
 
 def test_creating_the_admin_opens_the_page_on_the_searching_screen(env):
     c = env.app.app.test_client()
-    r = c.post("/setup", data={"token": env.app.setup_token, "username": "admin", "password": "correct-horse"})
+    r = c.post("/setup", data={"token": env.app.setup_token, "username": "admin", "password": "correct-horse", "csrf_token": form_csrf(c, "/setup")})
     assert r.status_code == 302
     assert r.headers["Location"].endswith("/?welcome=1")
     shown = c.get("/?welcome=1").get_data(as_text=True)
@@ -788,3 +824,420 @@ def test_the_searching_screen_is_hidden_on_a_normal_visit(env, logged_in):
     # anything but welcome=1 leaves it hidden
     tag = re.search(r'<div class="welcome" id="welcome"[^>]*>', c.get("/?welcome=0").get_data(as_text=True)).group(0)
     assert " hidden" in tag
+
+
+# ---- every route needs a sign-in ----------------------------------------------
+
+OPEN_ROUTES = {"static", "healthz", "login", "setup"}
+
+
+def test_every_route_but_the_open_ones_redirects_to_sign_in(env, logged_in):
+    """A route added later without @login_required fails here."""
+    c = env.app.app.test_client()
+    checked = 0
+    for rule in env.app.app.url_map.iter_rules():
+        if rule.endpoint in OPEN_ROUTES:
+            continue
+        path = re.sub(r"<[^>]+>", "x", rule.rule)
+        for method in rule.methods - {"HEAD", "OPTIONS"}:
+            r = c.open(path, method=method, json={} if method in ("POST", "PUT") else None)
+            assert r.status_code == 302 and r.headers["Location"].endswith("/login"), (method, rule.rule, r.status_code)
+            checked += 1
+    assert checked > 20
+    assert {r.endpoint for r in env.app.app.url_map.iter_rules()} >= OPEN_ROUTES
+
+
+# ---- environment settings -------------------------------------------------------
+
+
+@pytest.fixture
+def polluted_environment(monkeypatch):
+    for name in ("BEHIND_PROXY", "READ_ONLY"):
+        monkeypatch.setenv(name, "true")
+    monkeypatch.setenv("UPDATE_CHECK", "false")
+    monkeypatch.setenv("PROXY_IP_HEADER", "cf")
+
+
+def test_the_test_app_ignores_the_developers_own_environment(polluted_environment, env, tmp_path):
+    assert env.app.BEHIND_PROXY is False and env.app.READ_ONLY is False
+    assert env.app.UPDATE_CHECK is True and env.app.PROXY_IP_HEADER == "xff"
+    assert env.app.DATA_DIR == str(tmp_path)
+
+
+def reload_app(monkeypatch, **variables):
+    for name, value in variables.items():
+        monkeypatch.setenv(name, value)
+    sys.modules.pop("app", None)
+    return importlib.import_module("app")
+
+
+@pytest.mark.parametrize("value,expected", [("cf", "cf"), ("XFF", "xff"), (" cf ", "cf")])
+def test_proxy_ip_header_setting(env, monkeypatch, value, expected):
+    assert reload_app(monkeypatch, PROXY_IP_HEADER=value).PROXY_IP_HEADER == expected
+
+
+def test_an_unknown_proxy_ip_header_falls_back_to_xff_with_a_warning(env, monkeypatch):
+    assert reload_app(monkeypatch, PROXY_IP_HEADER="x-real-ip").PROXY_IP_HEADER == "xff"
+    assert any("PROXY_IP_HEADER" in e["msg"] and e["level"] == "warn" for e in activity.snapshot()[0])
+
+
+def test_env_flags_are_read_at_import(env, monkeypatch):
+    module = reload_app(monkeypatch, BEHIND_PROXY="yes", READ_ONLY="1", UPDATE_CHECK="off")
+    assert module.BEHIND_PROXY is True and module.READ_ONLY is True and module.UPDATE_CHECK is False
+
+
+# ---- logout -----------------------------------------------------------------------
+
+
+def test_logout_is_post_only(env, logged_in):
+    c, _ = logged_in
+    assert c.get("/logout").status_code == 405
+    assert c.get("/api/containers").status_code == 200  # still signed in
+
+
+def test_logout_needs_the_csrf_token(env, logged_in):
+    c, _ = logged_in
+    assert c.post("/logout").status_code == 403
+    assert c.post("/logout", headers={"X-CSRF-Token": "wrong"}).status_code == 403
+    assert c.post("/logout", data={"csrf_token": "wrong"}).status_code == 403
+    assert c.get("/api/containers").status_code == 200
+
+
+def test_logout_with_the_header_or_the_form_field_signs_out(env, logged_in):
+    c, csrf = logged_in
+    r = c.post("/logout", headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 302 and r.headers["Location"].endswith("/login")
+    assert c.get("/api/containers").status_code == 302
+    c2 = env.app.app.test_client()
+    post_login(c2, "admin", "correct-horse")
+    with c2.session_transaction() as s:
+        token = s["csrf"]
+    assert c2.post("/logout", data={"csrf_token": token}).status_code == 302
+    assert c2.get("/api/containers").status_code == 302
+
+
+def test_logout_when_already_signed_out_lands_on_the_login_page(env, logged_in):
+    r = env.app.app.test_client().post("/logout")
+    assert r.status_code == 302 and r.headers["Location"].endswith("/login")
+
+
+# ---- login and setup carry a token before there is a session ---------------------
+
+
+def test_the_login_and_setup_pages_carry_a_token(env):
+    c = env.app.app.test_client()
+    page = c.get("/setup").get_data(as_text=True)
+    with c.session_transaction() as s:
+        assert re.search(r'name="csrf_token" value="%s"' % s["csrf_pre"], page)
+    env.app.setup_token = None
+    env.app.save_users({"a": {"hash": env.app.generate_password_hash("long-enough"), "role": "admin"}})
+    page = c.get("/login").get_data(as_text=True)
+    with c.session_transaction() as s:
+        assert re.search(r'name="csrf_token" value="%s"' % s["csrf_pre"], page)
+
+
+@pytest.mark.parametrize("token", [None, "", "guess", "\u00e9"])
+def test_login_without_the_right_token_is_refused_and_not_counted(env, logged_in, token):
+    c = env.app.app.test_client()
+    c.get("/login")
+    data = {"username": "admin", "password": "correct-horse"}
+    if token is not None:
+        data["csrf_token"] = token
+    assert c.post("/login", data=data).status_code == 403
+    assert c.get("/api/containers").status_code == 302
+    assert env.app._failures == {}
+
+
+def test_a_token_from_another_session_is_no_good(env, logged_in):
+    other = env.app.app.test_client()
+    token = form_csrf(other)
+    c = env.app.app.test_client()
+    c.get("/login")
+    assert c.post("/login", data={"username": "admin", "password": "correct-horse", "csrf_token": token}).status_code == 403
+
+
+@pytest.mark.parametrize("token", [None, "guess"])
+def test_setup_without_the_right_token_creates_nothing(env, token):
+    c = env.app.app.test_client()
+    c.get("/setup")
+    data = {"token": env.app.setup_token, "username": "admin", "password": "correct-horse"}
+    if token is not None:
+        data["csrf_token"] = token
+    assert c.post("/setup", data=data).status_code == 403
+    assert env.app.setup_token is not None and not os.path.exists(env.app.USERS_PATH)
+
+
+def test_the_form_token_is_replaced_by_the_session_token_after_sign_in(env, logged_in):
+    c, _ = logged_in
+    with c.session_transaction() as s:
+        assert "csrf_pre" not in s and s["csrf"]
+
+
+# ---- /setup input rules --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("username", ["a/b", "", "x" * 33, "white space", "\u00e9"])
+def test_setup_applies_the_username_rules(env, username):
+    c = env.app.app.test_client()
+    r = c.post("/setup", data={"token": env.app.setup_token, "username": username, "password": "correct-horse", "csrf_token": form_csrf(c, "/setup")})
+    assert r.status_code == 200 and b"Username:" in r.data
+    assert env.app.setup_token is not None
+
+
+def test_setup_refuses_a_password_over_256_characters(env):
+    c = env.app.app.test_client()
+    r = c.post("/setup", data={"token": env.app.setup_token, "username": "a", "password": "p" * 257, "csrf_token": form_csrf(c, "/setup")})
+    assert r.status_code == 200 and b"256" in r.data and env.app.setup_token is not None
+
+
+def test_non_ascii_setup_token_is_refused_not_a_500(env):
+    c = env.app.app.test_client()
+    r = c.post("/setup", data={"token": "t\u00f6ken", "username": "a", "password": "correct-horse", "csrf_token": form_csrf(c, "/setup")})
+    assert r.status_code == 200 and b"Invalid setup token" in r.data
+
+
+def test_non_ascii_csrf_header_is_a_403_not_a_500(env, logged_in):
+    c, _ = logged_in
+    env.client.add(FakeContainer("web"))
+    r = c.post("/api/containers/web/stop", headers={"X-CSRF-Token": "t\u00f6ken".encode("latin-1")})
+    assert r.status_code == 403
+
+
+def test_safe_eq(env):
+    eq = env.app._safe_eq
+    assert eq("abc", "abc") and not eq("abc", "abd") and not eq("t\u00f6", "to")
+    assert eq("t\u00f6", "t\u00f6")
+
+
+# ---- sessions ----------------------------------------------------------------------------
+
+
+def test_sessions_last_twelve_hours(env, logged_in):
+    from datetime import timedelta
+
+    assert env.app.SESSION_LIFETIME == timedelta(hours=12)
+    assert env.app.app.permanent_session_lifetime == timedelta(hours=12)
+    c = env.app.app.test_client()
+    r = post_login(c, "admin", "correct-horse")
+    cookie = r.headers["Set-Cookie"]
+    assert "Expires=" in cookie and "HttpOnly" in cookie
+    with c.session_transaction() as s:
+        assert s.permanent
+
+
+def test_an_expired_session_cookie_is_signed_out(env, logged_in, monkeypatch):
+    from datetime import timedelta
+
+    c, _ = logged_in
+    assert c.get("/api/containers").status_code == 200
+    monkeypatch.setitem(env.app.app.config, "PERMANENT_SESSION_LIFETIME", timedelta(seconds=-1))
+    assert c.get("/api/containers").status_code == 302
+
+
+def test_unknown_user_still_costs_a_password_hash_check(env, logged_in, monkeypatch):
+    seen = []
+    real = env.app.check_password_hash
+    monkeypatch.setattr(env.app, "check_password_hash", lambda h, p: seen.append(h) or real(h, p))
+    c = env.app.app.test_client()
+    assert post_login(c, "nobody", "whatever-it-is").status_code == 401
+    assert seen == [env.app._DUMMY_HASH]
+
+
+def test_login_failures_for_a_quiet_address_are_forgotten(env, logged_in, monkeypatch):
+    env.app.record_failure("9.9.9.9")
+    assert "9.9.9.9" in env.app._failures
+    monkeypatch.setattr(env.app.time, "time", lambda: 10**10)
+    assert env.app.throttled("9.9.9.9") is False
+    assert "9.9.9.9" not in env.app._failures
+
+
+# ---- response headers ---------------------------------------------------------------------
+
+
+CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; frame-ancestors 'none'"
+
+
+@pytest.mark.parametrize("path", ["/", "/api/containers", "/api/vitals", "/api/debug"])
+def test_signed_in_responses_carry_the_security_headers(env, logged_in, path):
+    c, _ = logged_in
+    r = c.get(path)
+    assert r.status_code == 200
+    assert r.headers["Content-Security-Policy"] == CSP
+    assert r.headers["X-Frame-Options"] == "DENY"
+    assert r.headers["X-Content-Type-Options"] == "nosniff"
+    assert r.headers["Cache-Control"] == "no-store"
+
+
+def test_pages_and_redirects_carry_the_headers_too(env):
+    c = env.app.app.test_client()
+    for r in (c.get("/setup"), c.get("/login"), c.get("/nowhere")):
+        assert r.headers["X-Frame-Options"] == "DENY" and r.headers["Content-Security-Policy"] == CSP
+    assert c.get("/setup").headers["Cache-Control"] == "no-store"  # the form carries a token
+    assert c.get("/api/containers").headers["Cache-Control"] == "no-store"  # also when it only redirects
+    assert c.post("/api/containers/x/stop").headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_static_files_get_the_headers_but_stay_cacheable(env):
+    r = env.app.app.test_client().get("/static/app.js")
+    assert r.status_code == 200 and r.headers["X-Content-Type-Options"] == "nosniff"
+    assert r.headers["Content-Security-Policy"] == CSP
+    assert "no-store" not in r.headers.get("Cache-Control", "")
+
+
+def test_a_header_set_by_a_view_is_not_overwritten(env, logged_in):
+    c, _ = logged_in
+    with env.app.app.test_request_context("/"):
+        resp = env.app.app.make_response(("x", 200, {"X-Frame-Options": "SAMEORIGIN"}))
+        assert env.app.security_headers(resp).headers["X-Frame-Options"] == "SAMEORIGIN"
+
+
+def test_the_page_has_no_inline_script_or_style_that_the_policy_would_block(env, logged_in):
+    c, _ = logged_in
+    for path in ("/", "/login"):
+        html = c.get(path).get_data(as_text=True)
+        assert not re.search(r"<style|\sstyle=|\sonclick=|<script(?![^>]*\ssrc=)", html), path
+
+
+# ---- health check --------------------------------------------------------------------------
+
+
+def test_healthz_is_503_when_docker_cannot_be_reached(env, logged_in):
+    env.client.ping_error = RuntimeError("no socket")
+    r = env.app.app.test_client().get("/healthz")
+    assert r.status_code == 503 and r.get_json() == {"ok": False}
+    env.client.ping_error = None
+    assert env.app.app.test_client().get("/healthz").status_code == 200
+
+
+def test_healthz_is_503_when_ping_says_no(env, logged_in, monkeypatch):
+    monkeypatch.setattr(env.client, "ping", lambda: False)
+    assert env.app.app.test_client().get("/healthz").status_code == 503
+
+
+def test_healthz_is_ok_before_setup_even_without_docker(env):
+    env.client.ping_error = RuntimeError("no socket")
+    assert env.app.setup_token is not None
+    assert env.app.app.test_client().get("/healthz").status_code == 200
+
+
+# ---- files and secrets ---------------------------------------------------------------------
+
+
+def mode(path):
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def test_the_secret_key_is_created_once_and_kept(env, monkeypatch):
+    assert mode(env.app.SECRET_PATH) == 0o600
+    first = env.app.app.secret_key
+    assert len(first) == 64 and env.app.load_secret_key() == first
+    assert reload_app(monkeypatch).app.secret_key == first  # a restart keeps the sessions valid
+
+
+def test_data_files_are_private(env, logged_in):
+    c, csrf = logged_in
+    assert mode(env.app.USERS_PATH) == 0o600
+    assert c.put("/api/groups", json=env.app.empty_groups(), headers={"X-CSRF-Token": csrf}).status_code == 200
+    assert mode(env.app.groups_path("admin")) == 0o600
+    env.app.write_json(env.app.GROUPS_PATH, {})
+    assert mode(env.app.GROUPS_PATH) == 0o600
+    leftovers = [n for d in (env.data, env.app.GROUPS_DIR) for n in os.listdir(d) if n.endswith(".tmp")]
+    assert leftovers == []
+
+
+def test_a_failed_write_leaves_the_old_file_and_no_temp_file(env, logged_in):
+    path = env.app.USERS_PATH
+    before = open(path).read()
+    with pytest.raises(TypeError):
+        env.app.write_json(path, {"x": object()})
+    assert open(path).read() == before
+    assert [n for n in os.listdir(env.data) if n.endswith(".tmp")] == []
+
+
+# ---- damaged data files --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("content", ["{not json", "[]", '"text"', "null", '{"a": 5}', b"\xff\xfe".decode("latin-1")])
+def test_a_damaged_users_file_is_an_error_never_an_empty_list(env, logged_in, content):
+    with open(env.app.USERS_PATH, "w", encoding="latin-1") as f:
+        f.write(content)
+    with pytest.raises(env.app.DataFileError, match="users.json"):
+        env.app.load_users()
+
+
+def test_a_missing_users_file_is_still_no_users(env):
+    assert env.app.load_users() == {}
+
+
+def test_the_app_refuses_to_start_on_a_damaged_users_file(env, logged_in, monkeypatch):
+    with open(env.app.USERS_PATH, "w") as f:
+        f.write("{oops")
+    with pytest.raises(Exception, match="users.json"):
+        reload_app(monkeypatch)
+
+
+def test_a_users_file_damaged_while_running_answers_503_and_logs_it(env, logged_in):
+    c, _ = logged_in
+    with open(env.app.USERS_PATH, "w") as f:
+        f.write("[]")
+    r = c.get("/api/containers")
+    assert r.status_code == 503 and "error" in r.get_json()
+    assert any("users.json" in e["msg"] and e["level"] == "error" for e in activity.snapshot()[0])
+    assert env.app.app.test_client().get("/setup").status_code == 302  # /setup stays closed
+    assert env.app.setup_token is None
+
+
+@pytest.mark.parametrize("content", ["{oops", "[]", "5", '"x"'])
+def test_a_damaged_groups_file_falls_back_to_defaults_with_one_warning(env, logged_in, content):
+    c, _ = logged_in
+    os.makedirs(env.app.GROUPS_DIR, exist_ok=True)
+    with open(env.app.groups_path("admin"), "w") as f:
+        f.write(content)
+    for _ in range(3):
+        r = c.get("/api/containers")
+        assert r.status_code == 200 and r.get_json()["groups"] == env.app.empty_groups()
+    warnings = [e for e in activity.snapshot()[0] if "was ignored" in e["msg"]]
+    assert len(warnings) == 1 and warnings[0]["level"] == "warn"
+
+
+def test_a_damaged_personal_groups_file_falls_through_to_the_shared_one(env, logged_in):
+    os.makedirs(env.app.GROUPS_DIR, exist_ok=True)
+    with open(env.app.groups_path("admin"), "w") as f:
+        f.write("[1]")
+    with open(env.app.GROUPS_PATH, "w") as f:
+        json.dump({"assignments": {"web": "Media"}, "custom_groups": ["Media"]}, f)
+    assert env.app.load_groups("admin")["assignments"] == {"web": "Media"}
+
+
+@pytest.mark.parametrize("content", ["[]", "5", "{oops", '"x"'])
+def test_a_damaged_integrations_file_reads_as_empty(env, content):
+    with open(env.app.INTEGRATIONS_PATH, "w") as f:
+        f.write(content)
+    assert env.app.load_integrations() == {"keys": {}, "dismissed": []}
+
+
+# ---- updates and housekeeping --------------------------------------------------------------
+
+
+def test_a_failed_update_is_forgotten_once_the_container_is_current(env, logged_in):
+    c, _ = logged_in
+    add_web(env)
+    env.app._jobs["web"] = {"state": "error", "error": "pull denied"}
+    assert update_of(c)["state"] == "error"  # still behind: the error stays
+    env.client.registry["app:1"] = "sha256:old"
+    env.app.check_registry()
+    assert update_of(c) is None
+    assert "web" not in env.app._jobs
+
+
+def test_registry_failures_are_logged(env, logged_in):
+    add_web(env)
+    env.client.registry.clear()
+    env.app.check_registry()
+    assert any("registry check for app:1 failed" in e["msg"] for e in activity.snapshot()[0])
+
+
+def test_the_own_container_check_is_one_function(env):
+    own = FakeContainer("dash", short_id="dashboardself")
+    assert env.app.is_self(own) and not env.app.is_self(FakeContainer("web"))
+    assert env.app.describe(own)["self"] is True
