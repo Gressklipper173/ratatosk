@@ -536,7 +536,8 @@ and last run and lets you switch one off or delete it. A schedule is a container
 every month on a day you pick. Day 29 to 31 means the last day of a shorter month.
 
 - **Timezone.** The time is in the one timezone chosen at the top of the Schedules list (UTC until you
-  pick). It applies to every schedule and is saved with them, so changing it moves them all. A time that
+  pick). Click the box and type part of a city ("hel" finds Europe/Helsinki), then pick a match with the
+  arrow keys and Enter, or with the mouse. It applies to every schedule and is saved with them, so changing it moves them all. A time that
   a clock change skips runs once, an hour later; one it repeats runs the first time.
 - **Update** does what the Update button does: it first asks the registry again, then pulls and
   recreates the container only if a newer image exists. If there is none, or the update cannot run (see

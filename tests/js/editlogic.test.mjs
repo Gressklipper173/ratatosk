@@ -168,3 +168,48 @@ test("the update check summary says what was checked, found and missed", () => {
   );
   assert.match(E.updateCheckSummary({ checked: 0, updates: 0, errors: [{ image: "", error: "docker down" }] }), /docker down/);
 });
+
+// ---- tzMatches (finding a timezone by what was typed)
+
+const ZONES = [
+  "Africa/Cairo", "America/Argentina/Buenos_Aires", "America/New_York", "Asia/Hong_Kong", "Asia/Ho_Chi_Minh",
+  "Europe/Helsinki", "Europe/London", "Europe/Oslo", "Pacific/Honolulu", "UTC",
+];
+
+test("typing a city finds it without the region", () => {
+  assert.deepEqual(E.tzMatches(ZONES, "helsinki", 10), ["Europe/Helsinki"]);
+  assert.deepEqual(E.tzMatches(ZONES, "Oslo", 10), ["Europe/Oslo"]);
+});
+
+test("one letter lists the cities that start with it, not the regions", () => {
+  assert.deepEqual(E.tzMatches(ZONES, "h", 10).slice(0, 4), ["Asia/Ho_Chi_Minh", "Asia/Hong_Kong", "Europe/Helsinki", "Pacific/Honolulu"]);
+});
+
+test("case, spaces and underscores don't matter", () => {
+  assert.deepEqual(E.tzMatches(ZONES, "NEW york", 10), ["America/New_York"]);
+  assert.deepEqual(E.tzMatches(ZONES, "new_york", 10), ["America/New_York"]);
+  assert.deepEqual(E.tzMatches(ZONES, "  hong kong ", 10), ["Asia/Hong_Kong"]);
+});
+
+test("a typed region or a full name works too", () => {
+  assert.deepEqual(E.tzMatches(ZONES, "europe/lon", 10), ["Europe/London"]);
+  assert.deepEqual(E.tzMatches(ZONES, "europe", 10), ["Europe/Helsinki", "Europe/London", "Europe/Oslo"]);
+});
+
+test("a match in the middle of a name comes after prefix matches", () => {
+  assert.deepEqual(E.tzMatches(ZONES, "buenos", 10), ["America/Argentina/Buenos_Aires"]);
+  assert.deepEqual(E.tzMatches(ZONES, "ires", 10), ["America/Argentina/Buenos_Aires"]);
+  // "ong" is inside Hong_Kong only
+  assert.deepEqual(E.tzMatches(ZONES, "ong", 10), ["Asia/Hong_Kong"]);
+});
+
+test("an exact city beats names that only start with it", () => {
+  assert.deepEqual(E.tzMatches(["Europe/Oslo_Extra", "Europe/Oslo", "Asia/Oslo"], "oslo", 10), ["Asia/Oslo", "Europe/Oslo", "Europe/Oslo_Extra"]);
+});
+
+test("nothing typed gives everything up to the limit; nothing matching gives nothing", () => {
+  assert.equal(E.tzMatches(ZONES, "", 3).length, 3);
+  assert.equal(E.tzMatches(ZONES, "   ", 100).length, ZONES.length);
+  assert.deepEqual(E.tzMatches(ZONES, "zzz", 10), []);
+  assert.deepEqual(E.tzMatches(ZONES, "utc", 10), ["UTC"]);
+});

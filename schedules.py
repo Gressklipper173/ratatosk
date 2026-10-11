@@ -26,14 +26,20 @@ DEFAULT_TZ = "UTC"
 SEARCH_DAYS = 62  # enough to find a monthly slot, which is never more than 31 days away
 
 
+# tz data also holds old aliases ("US/Pacific", "Hongkong", "EST5EDT", "Etc/GMT+5") that only add
+# noise when searching for a city, so the picker offers Region/City names and UTC
+OLD_PREFIXES = ("Etc/", "US/", "Canada/", "Brazil/", "Chile/", "Mexico/", "SystemV/", "posix/", "right/")
+
+
 def timezones():
     """Names the picker offers. Without tz data on the host only UTC is possible."""
     try:
         names = set(zoneinfo.available_timezones())
     except Exception:
         names = set()
+    names = {n for n in names if "/" in n and not n.startswith(OLD_PREFIXES)}
     names.add(DEFAULT_TZ)
-    return sorted(n for n in names if not n.startswith(("posix/", "right/")) and n != "localtime")
+    return sorted(names)
 
 
 def get_zone(name):

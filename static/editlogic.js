@@ -1,5 +1,6 @@
 // Pure helpers for the page (no DOM, no network), kept apart so Node can test them: putting a file's
-// line endings back after a raw edit, checking a group name, and running a task one at a time.
+// line endings back after a raw edit, checking a group name, running a task one at a time, and
+// finding a timezone by what was typed.
 // Loaded before app.js; also usable from Node (see tests/js/editlogic.test.mjs).
 
 (function (root) {
@@ -74,7 +75,32 @@
     return text;
   }
 
-  const api = { MAX_GROUP_NAME, lineEnding, restoreEol, groupNameProblem, coalesce, updateCheckSummary };
+  // The names in `all` (timezones like "Europe/Helsinki") that match what was typed, best first, at
+  // most `limit`. Case, spaces and underscores don't matter ("new york" finds America/New_York), and
+  // the city counts before the region, so "hel" puts Helsinki ahead of names that merely contain it.
+  // Order: the city is exactly what was typed, then the name or city starts with it, then some word
+  // starts with it, then it appears anywhere; ties go alphabetically. Nothing typed gives them all.
+  function tzMatches(all, query, limit) {
+    const flat = (s) => s.toLowerCase().replace(/[_\s]+/g, " ").trim();
+    const q = flat(query);
+    const out = [];
+    for (const name of all) {
+      const full = flat(name);
+      const city = full.slice(full.lastIndexOf("/") + 1);
+      let rank;
+      if (!q) rank = 0;
+      else if (city === q) rank = 0;
+      else if (city.startsWith(q) || full.startsWith(q)) rank = 1;
+      else if (full.split(/[/ ]/).some((w) => w.startsWith(q))) rank = 2;
+      else if (full.includes(q)) rank = 3;
+      else continue;
+      out.push({ name, rank });
+    }
+    out.sort((a, b) => a.rank - b.rank || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    return out.slice(0, limit).map((x) => x.name);
+  }
+
+  const api = { MAX_GROUP_NAME, lineEnding, restoreEol, groupNameProblem, coalesce, updateCheckSummary, tzMatches };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.EditLogic = api;
 })(typeof window !== "undefined" ? window : globalThis);

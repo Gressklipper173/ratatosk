@@ -90,6 +90,9 @@ def test_timezone_list_has_utc_and_real_zones():
     names = schedules.timezones()
     assert "UTC" in names and "Europe/Oslo" in names
     assert not any(n.startswith("posix/") for n in names)
+    # old aliases are left out; everything else is Region/City, plus UTC
+    assert not {"US/Pacific", "Hongkong", "EST5EDT", "Etc/GMT+5", "localtime"} & set(names)
+    assert all("/" in n for n in names if n != "UTC")
     assert schedules.valid_timezone("Europe/Oslo") and not schedules.valid_timezone("Mars/Base")
     assert schedules.get_zone("Mars/Base") is not None  # unknown falls back instead of crashing
 

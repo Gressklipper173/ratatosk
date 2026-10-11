@@ -401,8 +401,17 @@ dialog.cfg::backdrop { background: rgba(0, 0, 0, 0.45); }
 .sched-on input { width: 20px; height: 20px; accent-color: var(--accent); }
 .sched-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .sched-form .int-note { flex-basis: 100%; }
-.sched-form select, .sched-form input[type="time"], #schedules-box .set-field select { font: inherit; min-height: 36px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); padding: 0 8px; min-width: 0; max-width: 100%; }
+.sched-form select, .sched-form input[type="time"], .sched-tzbox input { font: inherit; min-height: 36px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); padding: 0 8px; min-width: 0; max-width: 100%; }
 .sched-form [hidden], .sched-form .int-note[hidden] { display: none; }
+/* the timezone search: the matches sit in the page flow under the box, so the dialog can't clip them */
+.sched-tz { flex-wrap: wrap; }
+.sched-tzbox { flex: 1 1 14rem; max-width: 22rem; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.sched-tzbox input { width: 100%; box-sizing: border-box; }
+.sched-tzlist { list-style: none; margin: 0; padding: 2px; max-height: 12rem; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.sched-tzlist li { padding: 6px 8px; border-radius: 4px; cursor: pointer; overflow-wrap: anywhere; }
+.sched-tzlist li[aria-selected="true"] { background: var(--panel-2); outline: 1px solid var(--accent); }
+.sched-tzlist li.current { font-weight: 600; }
+.sched-tzlist li.sched-tzhint { color: var(--muted); font-size: 0.8rem; cursor: default; }
 
 /* a game server's disk use in the Pelican panel */
 .disk-use { font-size: 0.8rem; color: var(--muted); }

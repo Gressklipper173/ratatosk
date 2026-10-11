@@ -153,19 +153,114 @@
     return row;
   }
 
+  // The timezone is found by typing ("hel" finds Europe/Helsinki) and picked from the matches, with
+  // the arrow keys and Enter or the mouse. The zone names come from the server, so only a real one
+  // can be chosen; the list is in the page flow (not a popup) so the scrolling dialog can't clip it.
+  const TZ_SHOWN = 50;
   function timezoneField(res, msg, reload) {
-    const label = el("label", "set-field");
+    const field = el("div", "set-field sched-tz");
     const text = el("span", "", "Timezone");
     text.append(el("small", "", `Times below are in this zone. It is ${res.now} there now.`));
-    const sel = select(res.timezones.map((z) => [z, z]), res.timezone, "Timezone");
-    sel.addEventListener("change", async () => {
-      const r = await call("/api/schedules/timezone", "PUT", { timezone: sel.value });
-      msg.show(r.error || `Timezone is now ${sel.value}.`, !!r.error);
+    const label = el("label", "");
+    label.htmlFor = "tz-input";
+    label.append(text);
+
+    const input = el("input");
+    input.id = "tz-input";
+    input.type = "text";
+    input.value = res.timezone;
+    input.placeholder = "Search, e.g. Helsinki";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.setAttribute("role", "combobox");
+    input.setAttribute("aria-autocomplete", "list");
+    input.setAttribute("aria-expanded", "false");
+    input.setAttribute("aria-controls", "tz-list");
+    const list = el("ul", "sched-tzlist");
+    list.id = "tz-list";
+    list.setAttribute("role", "listbox");
+    list.setAttribute("aria-label", "Timezones");
+    list.hidden = true;
+    const box = el("div", "sched-tzbox");
+    box.append(input, list);
+
+    let shown = [];
+    let active = 0;
+    const close = () => {
+      list.hidden = true;
+      input.setAttribute("aria-expanded", "false");
+      input.removeAttribute("aria-activedescendant");
+      input.value = res.timezone; // leaving without choosing puts the current zone back
+    };
+    const mark = () => {
+      [...list.children].forEach((li, i) => li.setAttribute("aria-selected", String(i === active)));
+      const li = list.children[active];
+      if (li && shown.length) {
+        input.setAttribute("aria-activedescendant", li.id);
+        li.scrollIntoView?.({ block: "nearest" });
+      }
+    };
+    const open = () => {
+      // the box shows the current zone until something is typed; then it is the search
+      const q = input.value === res.timezone ? "" : input.value;
+      shown = window.EditLogic.tzMatches(res.timezones, q, TZ_SHOWN);
+      // nothing typed: the current zone comes first and is the active one, so Enter changes nothing
+      if (!q) shown = [res.timezone, ...shown.filter((n) => n !== res.timezone)].slice(0, TZ_SHOWN);
+      const rows = shown.map((name, i) => {
+        const li = el("li", "", name);
+        li.id = `tz-opt-${i}`;
+        li.setAttribute("role", "option");
+        if (name === res.timezone) li.classList.add("current");
+        return li;
+      });
+      const total = window.EditLogic.tzMatches(res.timezones, q, Infinity).length;
+      if (!shown.length) rows.push(el("li", "sched-tzhint", "No timezone matches."));
+      else if (total > shown.length) rows.push(el("li", "sched-tzhint", `${total - shown.length} more, keep typing to narrow it down.`));
+      list.replaceChildren(...rows);
+      list.hidden = false;
+      input.setAttribute("aria-expanded", "true");
+      active = 0;
+      mark();
+    };
+    const choose = async (name) => {
+      list.hidden = true;
+      input.setAttribute("aria-expanded", "false");
+      if (name === res.timezone) { input.value = name; return; }
+      input.disabled = true;
+      const r = await call("/api/schedules/timezone", "PUT", { timezone: name });
+      msg.show(r.error || `Timezone is now ${name}.`, !!r.error);
       reload();
+    };
+
+    input.addEventListener("focus", () => { input.select(); open(); });
+    input.addEventListener("input", open);
+    input.addEventListener("blur", close);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        if (list.hidden) { open(); return; }
+        if (!shown.length) return;
+        active = (active + (e.key === "ArrowDown" ? 1 : shown.length - 1)) % shown.length;
+        mark();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        if (!list.hidden && shown[active]) choose(shown[active]);
+      } else if (e.key === "Escape" && !list.hidden) {
+        e.preventDefault();
+        e.stopPropagation(); // closes the list, not the Settings dialog behind it
+        close();
+      }
     });
-    if (res.read_only || readOnlyMode()) { sel.disabled = true; sel.title = "Ratatosk is read-only"; }
-    label.append(text, sel);
-    return label;
+    // mousedown, not click: the input must not lose focus first, or blur would close the list
+    list.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const i = [...list.children].indexOf(e.target.closest("li"));
+      if (i >= 0 && shown[i]) choose(shown[i]);
+    });
+
+    if (res.read_only || readOnlyMode()) { input.disabled = true; input.title = "Ratatosk is read-only"; }
+    field.append(label, box);
+    return field;
   }
 
   let kept = ""; // the last message survives the reload that follows a change
