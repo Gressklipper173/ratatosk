@@ -660,6 +660,13 @@ def test_update_button_blocked_when_compose_file_not_visible(env, logged_in, mon
     assert "compose file not visible" in update_of(c)["blocked"]
 
 
+def run_threads_inline(env, monkeypatch, run=True):
+    """The app's own background threads run on the spot (or not at all). Only the app module's name
+    for threading is replaced, so the thread pool the registry check uses still works."""
+    thread = lambda target, args, daemon: SimpleNamespace(start=(lambda: target(*args)) if run else (lambda: None))
+    monkeypatch.setattr(env.app, "threading", SimpleNamespace(Thread=thread))
+
+
 def test_update_runs_pull_then_up(env, logged_in, monkeypatch):
     c, csrf = logged_in
     add_web(env)
@@ -672,7 +679,7 @@ def test_update_runs_pull_then_up(env, logged_in, monkeypatch):
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(env.app.subprocess, "run", fake_run)
-    monkeypatch.setattr(env.app.threading, "Thread", lambda target, args, daemon: SimpleNamespace(start=lambda: target(*args)))
+    run_threads_inline(env, monkeypatch)
     r = c.post("/api/containers/web/update", headers={"X-CSRF-Token": csrf})
     assert r.status_code == 202
     assert [x[-2:] for x in calls] == [["pull", "web"], ["--no-deps", "web"]]
@@ -690,7 +697,7 @@ def test_failed_update_is_reported_on_the_row(env, logged_in, monkeypatch):
     monkeypatch.setattr(
         env.app.subprocess, "run", lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="", stderr="boom\npull denied")
     )
-    monkeypatch.setattr(env.app.threading, "Thread", lambda target, args, daemon: SimpleNamespace(start=lambda: target(*args)))
+    run_threads_inline(env, monkeypatch)
     assert c.post("/api/containers/web/update", headers={"X-CSRF-Token": csrf}).status_code == 202
     u = update_of(c)
     assert u["state"] == "error" and u["error"] == "pull denied"
@@ -715,7 +722,7 @@ def test_second_update_while_running_is_refused(env, logged_in, monkeypatch):
     add_web(env)
     monkeypatch.setattr(env.app.os.path, "exists", lambda p: True)
     monkeypatch.setattr(env.app.shutil, "which", lambda n: "/usr/bin/docker")
-    monkeypatch.setattr(env.app.threading, "Thread", lambda target, args, daemon: SimpleNamespace(start=lambda: None))
+    run_threads_inline(env, monkeypatch, run=False)
     h = {"X-CSRF-Token": csrf}
     assert c.post("/api/containers/web/update", headers=h).status_code == 202
     assert c.post("/api/containers/web/update", headers=h).status_code == 409
@@ -1241,3 +1248,121 @@ def test_the_own_container_check_is_one_function(env):
     own = FakeContainer("dash", short_id="dashboardself")
     assert env.app.is_self(own) and not env.app.is_self(FakeContainer("web"))
     assert env.app.describe(own)["self"] is True
+
+
+# ---- "Check for updates now" and the checker's timing ---------------------
+
+
+def check_now(c, csrf):
+    return c.post("/api/updates/check", headers={"X-CSRF-Token": csrf})
+
+
+@pytest.fixture
+def no_cooldown(env, monkeypatch):
+    monkeypatch.setattr(env.app, "CHECK_COOLDOWN", 0)
+
+
+def test_the_check_covers_stopped_containers_too(env, logged_in, no_cooldown):
+    c, csrf = logged_in
+    add_web(env, status="exited")
+    env.app._registry.clear()
+    r = check_now(c, csrf)
+    assert r.status_code == 200
+    assert r.get_json() == {"error": None, "checked": 1, "updates": 1, "errors": []}
+    assert update_of(c)["available"] is True
+
+
+def test_the_check_reports_images_the_registry_would_not_answer_for(env, logged_in, no_cooldown):
+    c, csrf = logged_in
+    add_web(env)
+    env.client.registry.clear()
+    body = check_now(c, csrf).get_json()
+    assert body["checked"] == 1 and body["updates"] == 1  # the earlier answer is kept
+    assert [e["image"] for e in body["errors"]] == ["app:1"]
+    assert "registry down" in body["errors"][0]["error"]
+
+
+def test_the_check_skips_local_builds_and_this_container(env, logged_in, no_cooldown):
+    c, csrf = logged_in
+    env.client.add(FakeContainer("built", labels=COMPOSE, image_ref="built:1", repo_digests=[]))
+    env.client.add(FakeContainer("dashboardself", labels=COMPOSE, image_ref="ratatosk:1", repo_digests=["ratatosk@sha256:a"], short_id="dashboardself"))
+    body = check_now(c, csrf).get_json()
+    assert body["checked"] == 0 and body["errors"] == []
+    assert env.app._attempted == {"built:1"}  # a local build is noted so it never asks again; this container is ignored
+    env.app._check_wake.clear()
+    c.get("/api/containers")
+    assert not env.app._check_wake.is_set()
+
+
+def test_the_check_is_admin_only_and_needs_the_csrf_token(env, logged_in, no_cooldown):
+    from test_users import make_user, sign_in
+
+    c, csrf = logged_in
+    assert c.post("/api/updates/check").status_code == 403
+    make_user(env, c, csrf)
+    o, ocsrf = sign_in(env, "op", "operator-pass")
+    assert check_now(o, ocsrf).status_code == 403
+    assert env.app.app.test_client().post("/api/updates/check").status_code in (302, 401)
+
+
+def test_the_check_is_refused_when_updates_are_off_and_allowed_in_read_only(env, logged_in, no_cooldown, monkeypatch):
+    c, csrf = logged_in
+    monkeypatch.setattr(env.app, "READ_ONLY", True)
+    assert check_now(c, csrf).status_code == 200
+    monkeypatch.setattr(env.app, "UPDATE_CHECK", False)
+    assert check_now(c, csrf).status_code == 400
+
+
+def test_the_check_has_a_cooldown_and_never_runs_twice_at_once(env, logged_in):
+    c, csrf = logged_in
+    assert check_now(c, csrf).status_code == 200
+    assert check_now(c, csrf).status_code == 429
+    env.app._last_manual = 0.0
+    assert env.app._check_lock.acquire(blocking=False)
+    try:
+        assert check_now(c, csrf).status_code == 409
+    finally:
+        env.app._check_lock.release()
+
+
+def test_settings_show_the_button_to_admins_when_checks_are_on(env, logged_in, monkeypatch):
+    from test_users import make_user, sign_in
+
+    c, csrf = logged_in
+    assert b'id="check-updates"' in c.get("/").data
+    make_user(env, c, csrf)
+    o, _ = sign_in(env, "op", "operator-pass")
+    assert b'id="check-updates"' not in o.get("/").data
+    monkeypatch.setattr(env.app, "UPDATE_CHECK", False)
+    assert b'id="check-updates"' not in c.get("/").data
+
+
+def test_a_container_with_an_image_nobody_asked_about_wakes_the_checker(env, logged_in):
+    c, _ = logged_in
+    env.app._check_wake.clear()
+    add_web(env)  # add_web runs a pass, so web's image is known
+    env.app._check_wake.clear()
+    c.get("/api/containers")
+    assert not env.app._check_wake.is_set()
+    env.client.add(FakeContainer("other", labels={**COMPOSE, "com.docker.compose.service": "other"}, image_ref="new:1", repo_digests=["new@sha256:a"]))
+    c.get("/api/containers")
+    assert env.app._check_wake.is_set()
+
+
+def test_the_checker_retries_once_soon_after_a_failed_first_pass(env, monkeypatch):
+    waits = []
+
+    class Stop(Exception):
+        pass
+
+    def wait(delay):
+        waits.append(delay)
+        if len(waits) == 3:
+            raise Stop
+
+    results = iter([{"checked": 1, "updates": 0, "errors": [{"image": "a", "error": "down"}]}] * 3)
+    monkeypatch.setattr(env.app, "check_registry", lambda: next(results))
+    monkeypatch.setattr(env.app._check_wake, "wait", wait)
+    with pytest.raises(Stop):
+        env.app._update_checker()
+    assert waits == [env.app.CHECK_RETRY, env.app.UPDATE_INTERVAL, env.app.UPDATE_INTERVAL]

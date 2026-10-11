@@ -6,3 +6,5 @@ docker==7.1.0
 gunicorn==23.0.0
 psutil==6.0.0
 PyYAML==6.0.2
+# Time zone names for the schedule picker; the slim base image may not ship them
+tzdata==2026.5

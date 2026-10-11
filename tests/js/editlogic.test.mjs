@@ -154,3 +154,17 @@ test("a task that throws at once still frees the queue", async () => {
   await assert.rejects(run(), /sync/);
   assert.equal(n, 2);
 });
+
+// ---- updateCheckSummary ("Check for updates now")
+
+test("the update check summary says what was checked, found and missed", () => {
+  assert.equal(E.updateCheckSummary({ checked: 0, updates: 0, errors: [] }), "No Compose containers with a registry image to check.");
+  assert.equal(E.updateCheckSummary({ checked: 1, updates: 0, errors: [] }), "Checked 1 image: no updates.");
+  assert.equal(E.updateCheckSummary({ checked: 14, updates: 2, errors: [] }), "Checked 14 images: 2 updates available.");
+  assert.equal(E.updateCheckSummary({ checked: 3, updates: 1, errors: [] }), "Checked 3 images: 1 update available.");
+  assert.equal(
+    E.updateCheckSummary({ checked: 2, updates: 0, errors: [{ image: "ghcr.io/x/y", error: "APIError: denied" }] }),
+    "Checked 2 images: no updates. 1 image could not be checked (ghcr.io/x/y); the Debug log has the reason."
+  );
+  assert.match(E.updateCheckSummary({ checked: 0, updates: 0, errors: [{ image: "", error: "docker down" }] }), /docker down/);
+});

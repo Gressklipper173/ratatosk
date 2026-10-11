@@ -67,7 +67,7 @@ class FakeClient:
         self.by_name = {}
         self.registry = {}
         self.images = SimpleNamespace(get_registry_data=self._registry_data)
-        self.containers = SimpleNamespace(get=self._get, list=lambda all=False: list(self.by_name.values()))
+        self.containers = SimpleNamespace(get=self._get, list=self._list)
         self.ping_error = None  # set to an exception to make the daemon look unreachable
 
     def ping(self):
@@ -83,6 +83,10 @@ class FakeClient:
         if ref not in self.registry:
             raise RuntimeError("registry down")
         return SimpleNamespace(id=self.registry[ref])
+
+    def _list(self, all=False):
+        # like Docker: without all=True, only running containers
+        return [c for c in self.by_name.values() if all or c.status == "running"]
 
     def _get(self, name):
         import docker

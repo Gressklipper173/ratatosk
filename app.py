@@ -24,6 +24,7 @@ import activity
 import editor
 import handlers
 import integrations
+import schedules
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 READ_ONLY = os.environ.get("READ_ONLY", "").lower() in ("1", "true", "yes")
@@ -59,6 +60,7 @@ SECRET_PATH = os.path.join(DATA_DIR, "secret_key")
 GROUPS_PATH = os.path.join(DATA_DIR, "groups.json")
 GROUPS_DIR = os.path.join(DATA_DIR, "groups")
 INTEGRATIONS_PATH = os.path.join(DATA_DIR, "integrations.json")
+SCHEDULES_PATH = os.path.join(DATA_DIR, "schedules.json")
 
 # adapters: built-ins ship in ./adapters, an admin's own go in /data/adapters and win by id
 BUILTIN_ADAPTERS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adapters")
@@ -808,7 +810,7 @@ def healthz():
 @login_required
 def index():
     return render_template(
-        "index.html", version=VERSION, user=session["user"], role=current_user()[1], csrf_token=session["csrf"], read_only=READ_ONLY,
+        "index.html", version=VERSION, user=session["user"], role=current_user()[1], csrf_token=session["csrf"], read_only=READ_ONLY, update_check=UPDATE_CHECK,
         welcome=request.args.get("welcome") == "1",
     )
 
@@ -946,28 +948,98 @@ def image_ref(c):
     return "" if ref.startswith("sha256:") else ref
 
 
+_check_lock = threading.Lock()
+# images the registry has been asked about since start, answered or not, so a container whose image
+# is not in here yet (created or started after the last pass) can ask for a check now
+_attempted = set()
+_check_wake = threading.Event()
+CHECK_WORKERS = 4
+CHECK_RETRY = 60  # seconds before the first pass is repeated if some registry did not answer
+CHECK_COOLDOWN = 10  # seconds between "Check for updates now" clicks
+_last_manual = 0.0
+
+
+def is_pending(c):
+    """True when the registry's newest image for this container differs from the one it runs."""
+    latest = _registry.get(image_ref(c))
+    local = local_digests(c)
+    return bool(latest and local and latest not in local)
+
+
 def check_registry():
-    """One pass over the Compose containers' images; errors leave the old answer."""
-    refs = set()
+    """One pass over every Compose container's image, running or not; errors leave the old
+    answer. Returns {"checked", "updates", "errors": [{"image", "error"}]}, or None when another
+    pass is already running."""
+    if not _check_lock.acquire(blocking=False):
+        return None
     try:
-        for c in docker_client.containers.list():
-            labels = c.attrs.get("Config", {}).get("Labels") or {}
-            if compose_info(labels) and local_digests(c):
-                refs.add(image_ref(c))
-    except docker.errors.DockerException as e:
-        activity.log("warn", "updates", f"update check could not list containers: {e}")
-        return
-    for ref in refs - {""}:
+        found, refs = [], set()
         try:
-            _registry[ref] = docker_client.images.get_registry_data(ref).id
-        except Exception as e:
-            activity.log("warn", "updates", f"registry check for {ref} failed: {type(e).__name__}: {e}")
+            for c in docker_client.containers.list(all=True):
+                labels = c.attrs.get("Config", {}).get("Labels") or {}
+                ref = image_ref(c)
+                if not (ref and compose_info(labels)) or is_self(c):
+                    continue
+                _attempted.add(ref)  # even a local build, so it does not ask again
+                if local_digests(c):
+                    found.append(c)
+                    refs.add(ref)
+        except docker.errors.DockerException as e:
+            activity.log("warn", "updates", f"update check could not list containers: {e}")
+            return {"checked": 0, "updates": 0, "errors": [{"image": "", "error": str(e)[:200]}]}
+
+        def ask(ref):
+            try:
+                _registry[ref] = docker_client.images.get_registry_data(ref).id
+            except Exception as e:
+                activity.log("warn", "updates", f"registry check for {ref} failed: {type(e).__name__}: {e}")
+                return {"image": ref, "error": f"{type(e).__name__}: {e}"[:200]}
+            return None
+
+        with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as pool:
+            errors = [r for r in pool.map(ask, sorted(refs)) if r]
+        return {"checked": len(refs), "updates": sum(1 for c in found if is_pending(c)), "errors": errors}
+    finally:
+        _check_lock.release()
+
+
+def wake_if_unchecked(containers):
+    """Ask the checker for a pass now if a Compose container runs an image nobody has asked the
+    registry about yet, instead of leaving it to the next timer."""
+    for c in containers:
+        ref = image_ref(c)
+        if ref and ref not in _attempted and compose_info(c.attrs.get("Config", {}).get("Labels") or {}) and not is_self(c):
+            _check_wake.set()
+            return
 
 
 def _update_checker():
+    first = True
     while True:
-        check_registry()
-        time.sleep(UPDATE_INTERVAL)
+        result = check_registry()
+        # right after a boot the network or the registry may not answer yet: try once more soon
+        delay = CHECK_RETRY if first and result and result["errors"] else UPDATE_INTERVAL
+        first = False
+        _check_wake.wait(delay)
+        _check_wake.clear()
+
+
+@app.route("/api/updates/check", methods=["POST"])
+@admin_required
+def updates_check():
+    # asking registries changes nothing here, so this stays available in READ_ONLY mode
+    global _last_manual
+    if not csrf_ok():
+        return jsonify({"error": "bad csrf token"}), 403
+    if not UPDATE_CHECK:
+        return jsonify({"error": "update checks are switched off"}), 400
+    if time.monotonic() - _last_manual < CHECK_COOLDOWN:
+        return jsonify({"error": "checked a moment ago, try again in a few seconds"}), 429
+    result = check_registry()
+    if result is None:
+        return jsonify({"error": "a check is already running"}), 409
+    _last_manual = time.monotonic()
+    return jsonify({"error": None, **result})
 
 
 def update_blockers(files):
@@ -990,9 +1062,7 @@ def update_info(c, labels):
         job = _jobs.get(c.name)
     if job and job["state"] == "running":
         return {"available": True, "state": job["state"], "error": job["error"], "blocked": update_blockers(info[2])}
-    latest = _registry.get(image_ref(c))
-    local = local_digests(c)
-    pending = bool(latest and local and latest not in local)
+    pending = is_pending(c)
     if job:
         if pending:
             return {"available": True, "state": job["state"], "error": job["error"], "blocked": update_blockers(info[2])}
@@ -1084,6 +1154,8 @@ def api_containers():
         containers = docker_client.containers.list(all=True)
         # twice the page's refresh interval, so Pelican is asked about every other refresh at most
         refresh_pelican(containers, age_arg(PELICAN_STALE // 2, 1, 30) * 2)
+        if UPDATE_CHECK:
+            wake_if_unchecked(containers)
         items = [describe(c) for c in containers]
     except docker.errors.DockerException as e:
         return jsonify({"error": str(e), "items": []}), 502
@@ -1179,30 +1251,38 @@ def container_update(name):
         return jsonify({"error": "Ratatosk is in read-only mode"}), 403
     if not csrf_ok():
         return jsonify({"error": "bad csrf token"}), 403
+    error, code = start_update(name)
+    return jsonify({"error": error}), code
+
+
+def start_update(name):
+    """Begin updating one Compose container in the background. Returns (error, http status):
+    (None, 202) when it started. Shared by the Update button and the scheduler, which do their
+    own permission and read-only checks."""
     if not UPDATE_CHECK:
-        return jsonify({"error": "updates are switched off"}), 400
+        return "updates are switched off", 400
     try:
         c = docker_client.containers.get(name)
     except docker.errors.NotFound:
-        return jsonify({"error": "no such container"}), 404
+        return "no such container", 404
     except docker.errors.DockerException as e:
-        return jsonify({"error": str(e)}), 500
+        return str(e), 500
     if is_self(c):
-        return jsonify({"error": "Ratatosk can't update its own container"}), 400
+        return "Ratatosk can't update its own container", 400
     d = describe(c)
     if not d["update"]:
-        return jsonify({"error": "no update available"}), 400
+        return "no update available", 400
     if d["update"]["blocked"]:
-        return jsonify({"error": d["update"]["blocked"]}), 400
+        return d["update"]["blocked"], 400
     labels = c.attrs.get("Config", {}).get("Labels") or {}
     project, service, files, workdir = compose_info(labels)
     with _jobs_lock:
         if _jobs.get(name, {}).get("state") == "running":
-            return jsonify({"error": "already updating"}), 409
+            return "already updating", 409
         _jobs[name] = {"state": "running", "error": None}
     activity.log("info", "updates", f"update of {name} started")
     threading.Thread(target=_run_update, args=(name, project, service, files, workdir), daemon=True).start()
-    return jsonify({"error": None}), 202
+    return None, 202
 
 
 PELICAN_STALE = 10  # default seconds before the container list asks Pelican again
@@ -1266,10 +1346,18 @@ def container_action(name, action):
         return jsonify({"error": "bad csrf token"}), 403
     if action not in ACTIONS:
         return jsonify({"error": "unknown action"}), 400
+    error, code = run_container_action(name, action)
+    return jsonify({"error": error}), code
+
+
+def run_container_action(name, action):
+    """Start, stop or restart one container. Returns (error, http status): (None, 200) on
+    success. Shared by the buttons and the scheduler, which do their own permission and
+    read-only checks."""
     try:
         c = docker_client.containers.get(name)
         if is_self(c):
-            return jsonify({"error": "Ratatosk can't control its own container"}), 400
+            return "Ratatosk can't control its own container", 400
         if is_game_server(c.attrs.get("Config", {}).get("Labels") or {}):
             # Wings owns a game server's lifecycle: a stop sent straight to Docker looks like a
             # crash to it and it starts the server again, so go through the panel when we can
@@ -1279,22 +1367,22 @@ def container_action(name, action):
                     handlers.pelican_power(integrations.candidate_urls(ctx[0].attrs, ctx[1]["match"]["port"]), ctx[2], c.name, action)
                 except integrations.AppError as e:
                     activity.log("error", "containers", f"{action} {name} through Pelican failed: {e}")
-                    return jsonify({"error": str(e)}), 502
+                    return str(e), 502
                 activity.log("info", "containers", f"{action} {name} through Pelican")
                 _panel_cache.pop(ctx[0].name, None)  # the Pelican panel's list shows the old state otherwise
-                return jsonify({"error": None})
+                return None, 200
             activity.log("warn", "containers", f"{action} {name}: no Pelican user key, using Docker directly (Wings may treat a stop as a crash and restart it)")
         if action == "start":
             c.start()
         else:
             getattr(c, action)(timeout=10)
         activity.log("info", "containers", f"{action} {name}")
-        return jsonify({"error": None})
+        return None, 200
     except docker.errors.NotFound:
-        return jsonify({"error": "no such container"}), 404
+        return "no such container", 404
     except docker.errors.DockerException as e:
         activity.log("error", "containers", f"{action} {name} failed: {e}")
-        return jsonify({"error": str(e)}), 500
+        return str(e), 500
 
 
 @app.route("/api/containers/<name>", methods=["DELETE"])
@@ -1727,8 +1815,255 @@ def integration_dismiss(name, action):
     return jsonify({"error": None})
 
 
+SCHEDULE_TICK = 30  # seconds between looks at the clock
+SCHEDULE_GRACE = 300  # a slot noticed later than this is skipped and logged, not run late
+_schedule_stop = threading.Event()  # the scheduler waits on it between ticks; tests set it to end the loop
+
+
+def _number(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _clean_schedule(raw):
+    """A stored item as the code expects it, or None when it is damaged."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("id"), str):
+        return None
+    fields, err = schedules.validate(raw)
+    if err:
+        return None
+    result = raw.get("last_result")
+    return {
+        "id": raw["id"], **fields,
+        "last_slot": _number(raw.get("last_slot")) or 0,
+        "last_run": _number(raw.get("last_run")),
+        "last_result": result[:schedules.MAX_RESULT] if isinstance(result, str) else "",
+    }
+
+
+def load_schedules():
+    """{"timezone", "items"}; a missing or damaged file is an empty list (as for integrations)."""
+    try:
+        with open(SCHEDULES_PATH) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    raw = data.get("items")
+    items = [i for i in (_clean_schedule(r) for r in (raw if isinstance(raw, list) else [])) if i]
+    tz = data.get("timezone")
+    return {"timezone": tz if schedules.valid_timezone(tz) else schedules.DEFAULT_TZ, "items": items[:schedules.MAX_ITEMS]}
+
+
+def save_schedules(data):
+    write_json(SCHEDULES_PATH, data)
+
+
+def _rebase(item, tz, now):
+    """Count the newest slot already past as dealt with, so an edit, a new timezone or switching
+    an item on never runs for a time that has gone by."""
+    item["last_slot"] = schedules.prev_slot(item, tz, now) or 0
+
+
+def _schedule_outcome(label, err, code, done):
+    """Log and summarise one scheduled action: done, skipped (nothing to do or not possible
+    right now) or failed."""
+    if err is None:
+        activity.log("info", "schedules", f"{label}: {done}")
+        return done
+    if code in (400, 409):
+        activity.log("warn", "schedules", f"{label} skipped: {err}")
+        return f"skipped: {err}"[:schedules.MAX_RESULT]
+    activity.log("error", "schedules", f"{label} failed: {err}")
+    return f"failed: {err}"[:schedules.MAX_RESULT]
+
+
+def _run_schedule(item):
+    """Do one scheduled action and return a short result for the list."""
+    name = item["container"]
+    label = f"scheduled {item['action']} of {name}"
+    if READ_ONLY:
+        activity.log("warn", "schedules", f"{label} skipped: Ratatosk is in read-only mode")
+        return "skipped: read-only mode"
+    if item["action"] == "restart":
+        err, code = run_container_action(name, "restart")
+        return _schedule_outcome(label, err, code, "restarted")
+    # an update needs the registry's newest answer, which may be up to half an hour old
+    check_registry()
+    err, code = start_update(name)
+    return _schedule_outcome(label, err, code, "update started")
+
+
+def run_due_schedules(now):
+    """Run every schedule whose slot has come since the last look. A slot more than
+    SCHEDULE_GRACE late (Ratatosk was off or the host asleep) is logged as missed, not run."""
+    with _data_lock:
+        data = load_schedules()
+        tz = schedules.get_zone(data["timezone"])
+        due = []
+        for item in data["items"]:
+            if not item["enabled"]:
+                continue
+            slot = schedules.prev_slot(item, tz, now)
+            if slot is None or slot <= item["last_slot"]:
+                continue
+            item["last_slot"] = slot
+            due.append((dict(item), slot))
+        if due:
+            save_schedules(data)
+    for item, slot in due:
+        if now - slot > SCHEDULE_GRACE:
+            result = f"missed: not running at {schedules.fmt(slot, tz)}"
+            activity.log("warn", "schedules", f"scheduled {item['action']} of {item['container']} {result}")
+            ran = False
+        else:
+            result, ran = _run_schedule(item), True
+        with _data_lock:
+            data = load_schedules()
+            for stored in data["items"]:
+                if stored["id"] == item["id"]:
+                    stored["last_result"] = result
+                    if ran:
+                        stored["last_run"] = now
+                    save_schedules(data)
+                    break
+
+
+def _scheduler():
+    while True:
+        try:
+            run_due_schedules(time.time())
+        except Exception as e:
+            activity.log("error", "schedules", f"scheduler error: {type(e).__name__}: {e}")
+        if _schedule_stop.wait(SCHEDULE_TICK):
+            return
+
+
+def _schedule_view(item, tz, now, names):
+    nxt = schedules.next_slot(item, tz, now) if item["enabled"] else None
+    shown = {k: item[k] for k in ("id", "container", "action", "freq", "time", "weekday", "monthday", "enabled", "last_result")}
+    return {
+        **shown,
+        "next_run": schedules.fmt(nxt, tz),
+        "last_run": schedules.fmt(item["last_run"], tz),
+        "container_exists": names is None or item["container"] in names,
+    }
+
+
+def _schedule_target_error(fields):
+    """Why this container can't take this scheduled action, or None."""
+    try:
+        c = docker_client.containers.get(fields["container"])
+    except docker.errors.NotFound:
+        return "no such container"
+    except docker.errors.DockerException as e:
+        return str(e)
+    if is_self(c):
+        return "Ratatosk can't control its own container"
+    if fields["action"] == "update":
+        if not UPDATE_CHECK:
+            return "updates are switched off"
+        if compose_info(c.attrs.get("Config", {}).get("Labels") or {}) is None:
+            return "only Docker Compose containers can be updated"
+    return None
+
+
+def _schedule_write_refusal():
+    if READ_ONLY:
+        return jsonify({"error": "Ratatosk is in read-only mode"}), 403
+    if not csrf_ok():
+        return jsonify({"error": "bad csrf token"}), 403
+    return None
+
+
+@app.route("/api/schedules", methods=["GET", "POST"])
+@admin_required
+def api_schedules():
+    now = time.time()
+    if request.method == "POST":
+        refused = _schedule_write_refusal()
+        if refused:
+            return refused
+        fields, err = schedules.validate(request.get_json(silent=True))
+        err = err or (fields and _schedule_target_error(fields))
+        if err:
+            return jsonify({"error": err}), 400
+        with _data_lock:
+            data = load_schedules()
+            if len(data["items"]) >= schedules.MAX_ITEMS:
+                return jsonify({"error": f"at most {schedules.MAX_ITEMS} schedules"}), 400
+            item = {"id": secrets.token_hex(4), **fields, "last_slot": 0, "last_run": None, "last_result": ""}
+            _rebase(item, schedules.get_zone(data["timezone"]), now)
+            data["items"].append(item)
+            save_schedules(data)
+        return jsonify({"error": None, "id": item["id"]}), 201
+    try:
+        names = {c.name for c in docker_client.containers.list(all=True)}
+    except docker.errors.DockerException:
+        names = None  # can't tell, so don't flag anything as gone
+    data = load_schedules()
+    tz = schedules.get_zone(data["timezone"])
+    return jsonify({
+        "error": None,
+        "timezone": data["timezone"],
+        "timezones": schedules.timezones(),
+        "now": schedules.fmt(now, tz),
+        "read_only": READ_ONLY,
+        "update_check": UPDATE_CHECK,
+        "items": [_schedule_view(i, tz, now, names) for i in data["items"]],
+    })
+
+
+@app.route("/api/schedules/<sid>", methods=["PUT", "DELETE"])
+@admin_required
+def api_schedule(sid):
+    refused = _schedule_write_refusal()
+    if refused:
+        return refused
+    body = request.get_json(silent=True)
+    with _data_lock:
+        data = load_schedules()
+        item = next((i for i in data["items"] if i["id"] == sid), None)
+        if item is None:
+            return jsonify({"error": "no such schedule"}), 404
+        if request.method == "DELETE":
+            data["items"].remove(item)
+            save_schedules(data)
+            return jsonify({"error": None})
+        fields, err = schedules.validate(body, base=item)
+        if not err and (fields["container"], fields["action"]) != (item["container"], item["action"]):
+            err = _schedule_target_error(fields)
+        if err:
+            return jsonify({"error": err}), 400
+        item.update(fields)
+        _rebase(item, schedules.get_zone(data["timezone"]), time.time())
+        save_schedules(data)
+    return jsonify({"error": None})
+
+
+@app.route("/api/schedules/timezone", methods=["PUT"])
+@admin_required
+def api_schedules_timezone():
+    refused = _schedule_write_refusal()
+    if refused:
+        return refused
+    body = request.get_json(silent=True)
+    name = body.get("timezone") if isinstance(body, dict) else None
+    if not schedules.valid_timezone(name):
+        return jsonify({"error": "unknown timezone"}), 400
+    with _data_lock:
+        data = load_schedules()
+        data["timezone"] = name
+        tz, now = schedules.get_zone(name), time.time()
+        for item in data["items"]:
+            _rebase(item, tz, now)
+        save_schedules(data)
+    return jsonify({"error": None})
+
+
 # one gunicorn worker (see Dockerfile), so a single sampler thread; tests turn it off
 if os.environ.get("DISABLE_SAMPLER") != "1":
+    threading.Thread(target=_scheduler, daemon=True).start()
     threading.Thread(target=_stats_sampler, daemon=True).start()
     if UPDATE_CHECK:
         threading.Thread(target=_update_checker, daemon=True).start()

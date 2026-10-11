@@ -29,6 +29,13 @@ First public version.
   - Writes to the users and keys files are serialised and use a unique temporary file.
   - Dependencies are locked with hashes (`requirements.in` → `requirements.txt`, Flask 3.1.3 and
     gunicorn 23.0.0) and the base images are pinned by digest.
+- Schedules (admins): restart or update a container at a time of day, daily, weekly or monthly, from
+  **Schedule…** in a container's menu or **Settings → Schedules**. One timezone, picked in Settings; a run
+  missed while Ratatosk was off is skipped and logged; `READ_ONLY` skips them. Adds the `tzdata`
+  package to the locked requirements and `schedules.py` to the image.
+- **Settings → Updates → Check for updates now** (admins) checks every Compose container's registry on
+  demand, stopped containers included. The automatic check also covers stopped containers, repeats
+  once a minute after a start if a registry did not answer, and runs when a container with a new image appears.
 - `/healthz` also asks Docker and answers 503 when the socket is missing or unusable.
 - The example compose file publishes `127.0.0.1:8090` only and sets `no-new-privileges`.
 - qBittorrent: a rejected login is not retried for about five minutes, to stay clear of its IP ban.

@@ -61,7 +61,20 @@
     return run;
   }
 
-  const api = { MAX_GROUP_NAME, lineEnding, restoreEol, groupNameProblem, coalesce };
+  // One line for the result of "Check for updates now": {checked, updates, errors: [{image, error}]}.
+  function updateCheckSummary(r) {
+    const n = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
+    const errors = r.errors || [];
+    if (!r.checked && !errors.length) return "No Compose containers with a registry image to check.";
+    let text = `Checked ${n(r.checked, "image")}: ` + (r.updates ? `${n(r.updates, "update")} available.` : "no updates.");
+    if (errors.length) {
+      const names = errors.map((e) => e.image || e.error).join(", ");
+      text += ` ${n(errors.length, "image")} could not be checked (${names}); the Debug log has the reason.`;
+    }
+    return text;
+  }
+
+  const api = { MAX_GROUP_NAME, lineEnding, restoreEol, groupNameProblem, coalesce, updateCheckSummary };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.EditLogic = api;
 })(typeof window !== "undefined" ? window : globalThis);

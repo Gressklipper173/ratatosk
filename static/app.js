@@ -605,10 +605,50 @@ function deleteContainer(c) {
   dlg.showModal();
 }
 
+// Schedule a restart or update of one container. The form is the one Settings uses (schedules.js);
+// the server checks everything again (admin, not Ratatosk itself, Compose for an update).
+async function scheduleContainer(c) {
+  if (editing) return;
+  const dlg = el("dialog", "cfg narrow");
+  const title = el("h2", null, `Schedule ${displayName(c)}`);
+  title.id = "schedule-title";
+  dlg.setAttribute("aria-labelledby", title.id);
+  const body = el("div", "cfg-body");
+  const head = el("div", "cfg-head");
+  head.append(title, miniButton("Close", "", () => dlg.close()));
+  dlg.append(head, body);
+  body.append(el("p", "hint", "Loading…"));
+  dlg.addEventListener("close", () => dlg.remove());
+  document.body.append(dlg);
+  dlg.showModal();
+  let info;
+  try {
+    info = await api("/api/schedules");
+  } catch (e) {
+    info = { error: String(e) };
+  }
+  if (info.error || !window.scheduleForm) {
+    body.replaceChildren(el("p", "int-note bad", info.error || "The schedule form did not load."));
+    return;
+  }
+  body.replaceChildren(
+    window.scheduleForm({
+      container: c.name,
+      updateCheck: info.update_check,
+      readOnly: info.read_only,
+      note: `Times are in ${info.timezone} (it is ${info.now} there now). Change the zone and see every schedule under Settings → Schedules.`,
+      onDone: (text) => {
+        body.replaceChildren(el("p", "hint", text), miniButton("Done", "primary", () => dlg.close()));
+      },
+    })
+  );
+}
+
 async function updateContainer(c, btn) {
   if (editing) return;
+  const stopNote = c.status === "running" ? "" : "It is stopped now, and updating starts it.\n\n";
   const ok = confirm(
-    `Update ${displayName(c)}?\n\nThe new image is pulled and the container is recreated. ` +
+    `Update ${displayName(c)}?\n\n${stopNote}The new image is pulled and the container is recreated. ` +
     "Apps with a database may migrate it on first start, and that usually can't be undone, " +
     "so back up the app's data first."
   );
@@ -864,7 +904,8 @@ function makeItem(name) {
       const running = wings ? wings !== "offline" : c.status === "running";
       const canDelete = role === "admin" && !c.game && !c.self && ["exited", "created", "dead"].includes(c.status);
       const canUpdate = role === "admin" && upd && upd.state !== "running" && !c.self; // updating is an admin action
-      const key = [running, c.self, readOnly, upd?.state, upd?.blocked, canDelete, canUpdate].join("|");
+      const canSchedule = role === "admin" && !c.self;
+      const key = [running, c.self, readOnly, upd?.state, upd?.blocked, canDelete, canUpdate, canSchedule].join("|");
       if (key === actionKey) return;
       actionKey = key;
       actionBtns.replaceChildren();
@@ -891,6 +932,13 @@ function makeItem(name) {
         } else {
           b.addEventListener("click", () => act(c.name, a, b));
         }
+        actionBtns.append(b);
+      }
+      if (canSchedule) {
+        const b = el("button", "act schedule", "Schedule…");
+        b.type = "button";
+        b.title = "Restart or update this container at a set time";
+        b.addEventListener("click", () => scheduleContainer(c));
         actionBtns.append(b);
       }
       if (canDelete) {
@@ -2171,6 +2219,25 @@ document.getElementById("settings-close").addEventListener("click", () => settin
 // a click on the backdrop (the dialog itself, outside its content) closes it
 settingsDlg.addEventListener("click", (e) => { if (e.target === settingsDlg) settingsDlg.close(); });
 settingsDlg.addEventListener("close", () => settingsBtn.focus());
+
+// admins only, and only when update checks are on: the button is not in the page otherwise
+const checkUpdatesBtn = document.getElementById("check-updates");
+if (checkUpdatesBtn) {
+  const checkStatus = document.getElementById("check-updates-status");
+  checkUpdatesBtn.addEventListener("click", async () => {
+    checkUpdatesBtn.disabled = true;
+    checkStatus.textContent = "Checking…";
+    try {
+      const r = await api("/api/updates/check", { method: "POST" });
+      checkStatus.textContent = r.error || EditLogic.updateCheckSummary(r);
+    } catch (e) {
+      checkStatus.textContent = String(e);
+    } finally {
+      checkUpdatesBtn.disabled = false;
+    }
+    refresh(); // paint the new badges now
+  });
+}
 
 toggleAllBtn.addEventListener("click", () => {
   const boxes = [...boardEl.querySelectorAll(".panel")];

@@ -81,6 +81,12 @@
       <h3 class="cfg-section">Integrations</h3>
       <button class="mini" id="restore-integrations" type="button" hidden>Restore dismissed integrations</button>
       <p class="hint" id="no-dismissed">Nothing dismissed.</p>
+      {% if role == "admin" and update_check %}
+      <h3 class="cfg-section">Updates</h3>
+      <p class="hint">Ratatosk asks each Compose container's registry every 30 minutes whether a newer image exists, stopped containers included. The image names are sent to those registries.</p>
+      <button class="mini" id="check-updates" type="button">Check for updates now</button>
+      <p class="hint" id="check-updates-status" role="status"></p>
+      {% endif %}
       <h3 class="cfg-section">Account</h3>
       <p class="hint">Signed in as {{ user }} ({{ role }}). Your layout and groups belong to this account.</p>
       <div id="account-box"></div>
@@ -88,6 +94,9 @@
       <h3 class="cfg-section">Users</h3>
       <p class="hint">Admins manage users and app keys, update containers and read the Debug log. Operators can start, stop and restart containers, edit game servers' config files and arrange their own page.</p>
       <div id="users-box"></div>
+      <h3 class="cfg-section">Schedules</h3>
+      <p class="hint">Restart or update a container at a set time, every day, week or month. A time Ratatosk misses (it was off) is skipped, not run late. An update runs only if a newer image exists. Admins only.</p>
+      <div id="schedules-box"></div>
       {% endif %}
     </div>
   </dialog>
@@ -114,4 +123,5 @@
 <script src="{{ url_for('static', filename='editlogic.js') }}"></script>
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 <script src="{{ url_for('static', filename='users.js') }}"></script>
+<script src="{{ url_for('static', filename='schedules.js') }}"></script>
 {% endblock %}

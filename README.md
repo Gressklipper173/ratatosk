@@ -17,6 +17,7 @@ between the realms.*
 - Link tiles: a "go to" tile for every running container that publishes a port
 - The browser tab shows the overall status: a green, amber or red dot and the count (for example "11/12 · Ratatosk")
 - Update badges and an Update button for Docker Compose containers
+- Schedules: restart or update a container at a set time every day, week or month (admins)
 - Optional panels for apps it knows (see [Integrations](#integrations)), and a YAML format for your own
 - A **Debug** button that shows what Ratatosk itself is doing (app requests,
   key steps, sign-ins, errors), so you don't need shell access to find out why a panel is empty
@@ -27,7 +28,7 @@ between the realms.*
 **Contents:** [Quick start](#quick-start) · [Updating](#updating-ratatosk) · [Backup and restore](#backup-and-restore) ·
 [Uninstall](#uninstall) · [Troubleshooting](#troubleshooting) · [Configuration](#configuration) ·
 [Security](#security) · [Debug](#debug) · [Panels and layout](#panels-and-layout) · [Users](#users) ·
-[Groups](#groups) · [Link tiles](#link-tiles) · [Updates](#updates) · [Integrations](#integrations) ·
+[Groups](#groups) · [Link tiles](#link-tiles) · [Updates](#updates) · [Schedules](#schedules) · [Integrations](#integrations) ·
 [Development](#development) · [License](#license)
 
 ## Quick start
@@ -238,6 +239,7 @@ port. Everything it stores is in `DATA_DIR`:
 | `users.json` | Accounts (password hashes) and roles |
 | `integrations.json` | App keys and logins you entered (mode 0600, not encrypted; Ratatosk runs as root, so the mode does not keep other root processes or anyone with Docker access out) |
 | `groups/` | One file per user: layout, groups, names, priorities, storage meters |
+| `schedules.json` | Scheduled restarts and updates, and the timezone they use |
 | `secret_key` | Signs the session cookies |
 | `adapters/` | Your own app adapters, if you mount some |
 
@@ -381,8 +383,8 @@ only admins see it. There are two roles:
 
 | Role | Can do |
 |------|--------|
-| Admin | Everything an operator can, plus add, remove and change users, reset passwords, find, enter or remove app keys, update and delete containers, and use the Debug panel |
-| Operator | Look at everything except the Debug log, start, stop and restart containers, edit the config files of game servers, and arrange their own page. Cannot manage users or app keys, update or delete containers, or open Debug |
+| Admin | Everything an operator can, plus add, remove and change users, reset passwords, find, enter or remove app keys, update and delete containers, set up schedules, and use the Debug panel |
+| Operator | Look at everything except the Debug log, start, stop and restart containers, edit the config files of game servers, and arrange their own page. Cannot manage users or app keys, update or delete containers, set up schedules, or open Debug |
 
 - **Passwords:** an admin sets a password when adding a user and can reset it later. There is no
   email, so a forgotten password is reset by an admin. Everyone can change their own under
@@ -462,10 +464,20 @@ if both are set, the `ratatosk.` one wins.
 ## Updates
 
 Every 30 minutes Ratatosk asks each Compose container's registry whether its
-image tag now points at something newer than what is running. A container with a newer
-image gets an **Update** button. It asks for confirmation (apps with a database can
-migrate it on first start, so back up first), then runs `docker compose pull` and
-`up -d` for that one service.
+image tag now points at something newer than what is running. Stopped containers are
+included, so a server you switch off for a while still gets its badge (updating it starts it,
+and the confirmation says so). A container with a newer image gets an **Update** button.
+It asks for confirmation (apps with a database can migrate it on first start, so back up first),
+then runs `docker compose pull` and `up -d` for that one service.
+
+The answers are kept in memory, so a restart of Ratatosk clears them. It asks again right
+away, once more a minute later if a registry did not answer, and whenever a Compose container
+shows up with an image it has not asked about yet. To refresh them yourself, an admin can use
+**Settings → Updates → Check for updates now**. It checks every Compose container and shows
+how many images it checked, how many have updates, and which ones the registry would not answer
+for (the **Debug** panel has the reason). It works in `READ_ONLY` mode, since it only reads,
+and it is not shown when `UPDATE_CHECK=false`. Registries rate-limit anonymous requests, so
+clicking again within a few seconds is refused.
 
 Containers not started by Docker Compose, locally built images, and Ratatosk itself
 never show an update. The registry check sends the image name to its registry (Docker Hub
@@ -514,6 +526,33 @@ Things that trip people up:
   [Troubleshooting](#troubleshooting).
 - **An update badge can outlive the update.** If you updated the container by hand, the badge clears
   after the next registry check (every 30 minutes).
+
+## Schedules
+
+Admins can have Ratatosk restart or update a container by itself. Press **Schedule…** in a
+container's **⋯** menu, or open **Settings → Schedules**, which lists every schedule with its next
+and last run and lets you switch one off or delete it. A schedule is a container, an action
+(**Restart** or **Update**), a time, and how often: every day, every week on a weekday you pick, or
+every month on a day you pick. Day 29 to 31 means the last day of a shorter month.
+
+- **Timezone.** The time is in the one timezone chosen at the top of the Schedules list (UTC until you
+  pick). It applies to every schedule and is saved with them, so changing it moves them all. A time that
+  a clock change skips runs once, an hour later; one it repeats runs the first time.
+- **Update** does what the Update button does: it first asks the registry again, then pulls and
+  recreates the container only if a newer image exists. If there is none, or the update cannot run (see
+  [Making the Update button work](#making-the-update-button-work)) or one is already running, the run
+  is skipped and the list says why. Only Docker Compose containers can be scheduled for update, and
+  not when `UPDATE_CHECK=false`.
+- **Restart** works like the Restart button, including a Pelican game server going through its panel.
+- **Missed runs are not made up.** If Ratatosk was stopped, or the host asleep, more than 5 minutes
+  past the time, that run is skipped and noted as missed. The next one happens as normal. Editing a
+  schedule, switching it on or changing the timezone never runs it for a time that has already passed.
+- **`READ_ONLY=true`** switches off creating and changing schedules, and any that are due are skipped
+  and noted as such.
+- Ratatosk's own container can't be scheduled. A schedule follows the container's name, so it keeps
+  working after an update recreates the container; if the container is removed, the list marks the
+  schedule and each run fails with "no such container" until you delete it.
+- Each run, skip and failure is in the **Debug** panel under `schedules`.
 
 ## Integrations
 
