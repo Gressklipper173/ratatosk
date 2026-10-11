@@ -677,6 +677,7 @@ Put your files in a folder and mount it into Ratatosk, for example
 
 ```
 python3 -m venv .venv && . .venv/bin/activate
+pip install --require-hashes -r requirements.txt
 pip install -r requirements-dev.txt
 python -m pytest -q
 node --test tests/js/*.mjs     # the panel layout logic, no browser needed

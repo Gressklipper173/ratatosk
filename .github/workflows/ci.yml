@@ -28,8 +28,10 @@ jobs:
           cache: pip
           cache-dependency-path: |
             requirements.txt
-            requirements-dev.txt
-      - run: pip install -r requirements-dev.txt
+            requirements-test.txt
+      # two runs: requirements.txt is hash-locked, the test tools are only version-pinned
+      - run: pip install --require-hashes -r requirements.txt
+      - run: pip install -r requirements-test.txt
       - run: python -m pytest -q
 
   frontend:

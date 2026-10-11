@@ -13,6 +13,7 @@ follow [SECURITY.md](SECURITY.md) instead.
 
 ```
 python3 -m venv .venv && . .venv/bin/activate
+pip install --require-hashes -r requirements.txt
 pip install -r requirements-dev.txt
 python -m pytest -q
 node --test tests/js/*.mjs

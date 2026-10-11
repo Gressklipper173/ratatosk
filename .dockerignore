@@ -13,6 +13,7 @@ docs/
 # Tests and dev dependencies
 tests/
 requirements-dev.txt
+requirements-test.txt
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

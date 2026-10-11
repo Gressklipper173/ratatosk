@@ -1,5 +1,6 @@
--r requirements.txt
-pytest==8.3.3
+# Everything for development. Install requirements.txt first (with --require-hashes), then this
+# file on its own (see requirements-test.txt for why they can't be one pip run).
+-r requirements-test.txt
 # for regenerating requirements.txt and auditing it (see requirements.in)
 pip-tools==7.6.2
 pip-audit==2.10.1
