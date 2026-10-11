@@ -51,15 +51,16 @@
   }
 
   // Container choices: what the page already holds, else ask the server. Ratatosk's own
-  // container is left out (it can't be scheduled).
-  async function containerOptions() {
+  // container is left out (it can't be scheduled). `keep` narrows them further (for an update,
+  // only Docker Compose containers).
+  async function containerOptions(keep) {
     let list = typeof containers !== "undefined" ? containers : [];
     if (!list.length) {
       const res = await call("/api/containers", "GET");
       list = res.items || [];
     }
     return list
-      .filter((c) => !c.self)
+      .filter((c) => !c.self && (!keep || keep(c)))
       .map((c) => {
         const shown = typeof displayName === "function" ? displayName(c) : c.name;
         return [c.name, shown === c.name ? c.name : `${shown} (${c.name})`];
@@ -67,22 +68,35 @@
       .sort((a, b) => a[1].localeCompare(b[1]));
   }
 
-  // The containers of a new schedule: a list that is built by adding from the choices, kept in the
-  // order they will run, with buttons to move or remove each one. get() is the names in order.
+  // The containers of a new schedule: tick them in a list, and the ones ticked appear below in the
+  // order they will run (the order they were ticked in), with buttons to move each. get() is the
+  // names in run order.
   function containerPicker(names) {
     const labels = new Map(names);
     let chosen = [];
     let locked = false;
     const node = el("div", "sched-picks");
+    const fieldset = el("fieldset", "sched-checks");
+    fieldset.append(el("legend", "", "Containers"));
+    const boxes = new Map();
+    for (const [value, text] of names) {
+      const label = el("label", "sched-check");
+      const box = el("input");
+      box.type = "checkbox";
+      box.addEventListener("change", () => {
+        chosen = box.checked ? [...chosen, value] : chosen.filter((n) => n !== value);
+        draw();
+      });
+      boxes.set(value, box);
+      label.append(box, el("span", "", text));
+      fieldset.append(label);
+    }
+    if (!names.length) fieldset.append(el("p", "int-note", "No containers to choose from."));
+    const order = el("div", "sched-order");
+    const heading = el("p", "int-note", "Runs in this order, one after another:");
     const list = el("ol", "sched-chosen");
-    const pick = el("select");
-    pick.setAttribute("aria-label", "Container to add");
-    const add = el("button", "mini", "Add");
-    add.type = "button";
-    const row = el("div", "sched-addrow");
-    row.append(pick, add);
-    const hint = el("p", "int-note", "Containers run one after another, top to bottom.");
-    node.append(list, row, hint);
+    order.append(heading, list);
+    node.append(fieldset, order);
 
     function draw() {
       list.replaceChildren(...chosen.map((name, i) => {
@@ -96,38 +110,24 @@
           b.addEventListener("click", () => { chosen = window.EditLogic.moveItem(chosen, i, step); draw(); });
           li.append(b);
         }
-        const remove = el("button", "mini", "Remove");
-        remove.type = "button";
-        remove.setAttribute("aria-label", `Remove ${name}`);
-        remove.disabled = locked;
-        remove.addEventListener("click", () => { chosen = chosen.filter((n) => n !== name); draw(); });
-        li.append(remove);
         return li;
       }));
-      list.hidden = !chosen.length;
-      const rest = names.filter(([v]) => !chosen.includes(v));
-      pick.replaceChildren(...rest.map(([v, text]) => {
-        const o = el("option", "", text);
-        o.value = v;
-        return o;
-      }));
-      pick.disabled = add.disabled = locked || !rest.length;
+      // one container has no order to fix
+      order.hidden = chosen.length < 2;
+      for (const box of boxes.values()) box.disabled = locked;
     }
-    add.addEventListener("click", () => {
-      if (pick.value) { chosen = [...chosen, pick.value]; draw(); }
-    });
     draw();
     return { node, get: () => chosen.slice(), lock(flag) { locked = flag; draw(); } };
   }
 
   // The add form. opts: container (fixed container name, else a picker for several is shown), names
-  // (the picker's [value, label] pairs), updateCheck, readOnly, note (a line above the fields),
-  // onDone(text) after a schedule was saved.
+  // (the picker's [value, label] pairs), action (fixed action, else it can be chosen), updateCheck,
+  // readOnly, note (a line above the fields), onDone(text) after a schedule was saved.
   function scheduleForm(opts) {
     const form = el("form", "sched-form");
     const msg = status();
     const picker = opts.container ? null : containerPicker(opts.names || []);
-    const action = select([["restart", "Restart"], ["update", "Update"]], "restart", "Action");
+    const action = opts.action ? null : select([["restart", "Restart"], ["update", "Update"]], "restart", "Action");
     const freq = select(Object.entries(FREQ_TEXT), "daily", "Repeat");
     const weekday = select(WEEKDAYS.map((d, i) => [String(i), d]), "0", "Weekday");
     const monthday = select(Array.from({ length: 31 }, (_, i) => [String(i + 1), `Day ${i + 1}`]), "1", "Day of the month");
@@ -140,7 +140,7 @@
     add.type = "submit";
     const monthNote = el("p", "int-note", "The 31st (or any day a month doesn't have) means the last day of that month.");
 
-    if (!opts.updateCheck) {
+    if (action && !opts.updateCheck) {
       action.options[1].disabled = true;
       action.options[1].title = "Updates are switched off";
     }
@@ -153,15 +153,15 @@
 
     if (opts.note) form.append(el("p", "int-note sched-wide", opts.note));
     if (picker) form.append(picker.node);
-    form.append(action, freq, weekday, monthday, el("span", "sched-at", "at"), time, add, monthNote, msg.node);
+    form.append(...[action, freq, weekday, monthday, el("span", "sched-at", "at"), time, add].filter(Boolean), monthNote, msg.node);
     if (opts.readOnly || readOnlyMode()) {
-      for (const b of [action, freq, weekday, monthday, time, add]) { b.disabled = true; b.title = "Ratatosk is read-only"; }
+      for (const b of [action, freq, weekday, monthday, time, add].filter(Boolean)) { b.disabled = true; b.title = "Ratatosk is read-only"; }
       picker?.lock(true);
     }
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       if (!time.value) { msg.show("Choose a time.", true); return; }
-      const body = { containers: opts.container ? [opts.container] : picker.get(), action: action.value, freq: freq.value, time: time.value };
+      const body = { containers: opts.container ? [opts.container] : picker.get(), action: opts.action || action.value, freq: freq.value, time: time.value };
       if (!body.containers.length) { msg.show("Choose at least one container.", true); return; }
       if (freq.value === "weekly") body.weekday = Number(weekday.value);
       if (freq.value === "monthly") body.monthday = Number(monthday.value);
@@ -326,6 +326,39 @@
     return field;
   }
 
+  // "Update containers regularly": the same form in a dialog, for the common case. The action is
+  // fixed to Update, and only Docker Compose containers are offered since only they can be updated.
+  async function updateDialog(info, onSaved) {
+    const dlg = el("dialog", "cfg narrow");
+    const title = el("h2", null, "Update containers regularly");
+    title.id = "upd-sched-title";
+    dlg.setAttribute("aria-labelledby", title.id);
+    const head = el("div", "cfg-head");
+    const close = el("button", "mini", "Close");
+    close.type = "button";
+    close.addEventListener("click", () => dlg.close());
+    head.append(title, close);
+    const body = el("div", "cfg-body");
+    dlg.append(head, body);
+    dlg.addEventListener("close", () => dlg.remove());
+    body.append(el("p", "hint", "Loading…"));
+    document.body.append(dlg);
+    dlg.showModal();
+    const names = await containerOptions((c) => !!c.project);
+    if (!info.update_check) {
+      body.replaceChildren(el("p", "int-note bad", "Updates are switched off (UPDATE_CHECK is false)."));
+      return;
+    }
+    body.replaceChildren(scheduleForm({
+      names,
+      action: "update",
+      updateCheck: info.update_check,
+      readOnly: info.read_only,
+      note: `Tick the containers to update, in any order, then fix the order below. Each one is updated only if a newer image exists. Times are in ${info.timezone} (it is ${info.now} there now).`,
+      onDone: (text) => { dlg.close(); onSaved(text); },
+    }));
+  }
+
   let kept = ""; // the last message survives the reload that follows a change
   async function loadSchedules() {
     const res = await call("/api/schedules", "GET");
@@ -334,6 +367,12 @@
     const wrap = { show(t, b) { kept = t ? { text: t, bad: b } : ""; msg.show(t, b); } };
     if (res.error) { box.replaceChildren(el("p", "int-note bad", res.error)); return; }
     const parts = [timezoneField(res, wrap, loadSchedules)];
+    const regular = el("button", "btn primary", "Update containers regularly");
+    regular.type = "button";
+    regular.addEventListener("click", () => updateDialog(res, (text) => { kept = { text, bad: false }; loadSchedules(); }));
+    if (res.read_only || readOnlyMode()) { regular.disabled = true; regular.title = "Ratatosk is read-only"; }
+    parts.push(el("div", "sched-actions"));
+    parts[1].append(regular);
     if (res.items.length) {
       const list = el("ul", "sched-list");
       for (const it of res.items) list.append(scheduleRow(it, wrap, loadSchedules));

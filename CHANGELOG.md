@@ -31,8 +31,9 @@ First public version.
     gunicorn 23.0.0) and the base images are pinned by digest.
 - Schedules (admins): restart or update containers at a time of day, daily, weekly or monthly, from
   **Schedule…** in a container's menu or **Settings → Schedules**. A schedule can hold a list of up to
-  50 containers that run one after another in the order you set, each update waiting for the one before
-  it, and a failure does not stop the rest. One timezone, picked in Settings; a run
+  50 containers that you tick in a list and put in order, running one after another, each update waiting
+  for the one before it, and a failure does not stop the rest. **Settings → Schedules → Update
+  containers regularly** is the shortcut for updating several Compose containers. One timezone, picked in Settings; a run
   missed while Ratatosk was off is skipped and logged; `READ_ONLY` skips them. Adds the `tzdata`
   package to the locked requirements and `schedules.py` to the image.
 - **Settings → Updates → Check for updates now** (admins) checks every Compose container's registry on

@@ -531,14 +531,16 @@ Things that trip people up:
 
 Admins can have Ratatosk restart or update containers by itself. Press **Schedule…** in a
 container's **⋯** menu for that one container, or open **Settings → Schedules**, which lists every
-schedule with its next and last run, lets you switch one off or delete it, and builds a schedule for
-**several containers at once**. A schedule is one or more containers, an action (**Restart** or
+schedule with its next and last run and lets you switch one off or delete it. There, **Update
+containers regularly** opens a dialog where you tick the containers to keep up to date, and the form
+under the list builds any schedule (restart or update) for **several containers at once**. A schedule is one or more containers, an action (**Restart** or
 **Update**), a time, and how often: every day, every week on a weekday you pick, or every month on a
 day you pick. Day 29 to 31 means the last day of a shorter month.
 
-- **Several containers.** In Settings, pick containers one by one with **Add**; they run one after
-  another in the order shown (top to bottom), and the ↑ and ↓ buttons change it. Put a database
-  before the apps that use it. An update waits until the container before it has been updated; a
+- **Several containers.** Tick the containers in the list. They run one after another in the order
+  they were ticked, shown under the list as "Runs in this order", where the ↑ and ↓ buttons change it.
+  Put a database before the apps that use it. The **Update containers regularly** dialog offers only
+  Docker Compose containers, since only those can be updated. An update waits until the container before it has been updated; a
   container that cannot be done (no update, not a Compose container, gone, failed) is noted and the
   rest still run. The list shows the outcome in one line, for example
   `2 done, 1 failed (web: no such container)`, once the whole list has finished, and the **Debug**

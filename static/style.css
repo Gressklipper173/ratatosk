@@ -401,14 +401,19 @@ dialog.cfg::backdrop { background: rgba(0, 0, 0, 0.45); }
 .sched-on input { width: 20px; height: 20px; accent-color: var(--accent); }
 .sched-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .sched-form .int-note { flex-basis: 100%; }
-/* a new schedule's containers: the chosen ones in run order, then the picker to add another */
-.sched-picks { flex: 1 1 100%; display: flex; flex-direction: column; gap: 6px; }
+/* a new schedule's containers: a list to tick, then the ticked ones in run order */
+.sched-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+.sched-picks { flex: 1 1 100%; display: flex; flex-direction: column; gap: 8px; }
 .sched-picks .int-note { margin: 0; }
+.sched-checks { margin: 0; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; max-height: 14rem; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sched-checks legend { padding: 0 4px; color: var(--muted); font-size: 0.8rem; }
+.sched-check { display: flex; align-items: center; gap: 8px; min-height: 32px; overflow-wrap: anywhere; cursor: pointer; }
+.sched-check input { width: 18px; height: 18px; flex: none; accent-color: var(--accent); }
+.sched-order { display: flex; flex-direction: column; gap: 4px; }
+.sched-order[hidden] { display: none; }
 .sched-chosen { list-style: decimal inside; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-.sched-chosen[hidden] { display: none; }
 .sched-chosen li { display: flex; align-items: center; gap: 6px; }
 .sched-chosen .sched-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
-.sched-addrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .sched-form select, .sched-form input[type="time"], .sched-tzbox input { font: inherit; min-height: 36px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); padding: 0 8px; min-width: 0; max-width: 100%; }
 .sched-form [hidden], .sched-form .int-note[hidden] { display: none; }
 /* the timezone search: the matches sit in the page flow under the box, so the dialog can't clip them */
