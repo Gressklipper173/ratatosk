@@ -529,18 +529,28 @@ Things that trip people up:
 
 ## Schedules
 
-Admins can have Ratatosk restart or update a container by itself. Press **Schedule…** in a
-container's **⋯** menu, or open **Settings → Schedules**, which lists every schedule with its next
-and last run and lets you switch one off or delete it. A schedule is a container, an action
-(**Restart** or **Update**), a time, and how often: every day, every week on a weekday you pick, or
-every month on a day you pick. Day 29 to 31 means the last day of a shorter month.
+Admins can have Ratatosk restart or update containers by itself. Press **Schedule…** in a
+container's **⋯** menu for that one container, or open **Settings → Schedules**, which lists every
+schedule with its next and last run, lets you switch one off or delete it, and builds a schedule for
+**several containers at once**. A schedule is one or more containers, an action (**Restart** or
+**Update**), a time, and how often: every day, every week on a weekday you pick, or every month on a
+day you pick. Day 29 to 31 means the last day of a shorter month.
+
+- **Several containers.** In Settings, pick containers one by one with **Add**; they run one after
+  another in the order shown (top to bottom), and the ↑ and ↓ buttons change it. Put a database
+  before the apps that use it. An update waits until the container before it has been updated; a
+  container that cannot be done (no update, not a Compose container, gone, failed) is noted and the
+  rest still run. The list shows the outcome in one line, for example
+  `2 done, 1 failed (web: no such container)`, once the whole list has finished, and the **Debug**
+  panel has a line for each container. A schedule holds up to 50 containers, and all of them take the
+  same action and time; make a second schedule for a different action or time.
 
 - **Timezone.** The time is in the one timezone chosen at the top of the Schedules list (UTC until you
   pick). Click the box and type part of a city ("hel" finds Europe/Helsinki), then pick a match with the
   arrow keys and Enter, or with the mouse. It applies to every schedule and is saved with them, so changing it moves them all. A time that
   a clock change skips runs once, an hour later; one it repeats runs the first time.
 - **Update** does what the Update button does: it first asks the registry again, then pulls and
-  recreates the container only if a newer image exists. If there is none, or the update cannot run (see
+  recreates each container only if a newer image exists. If there is none, or the update cannot run (see
   [Making the Update button work](#making-the-update-button-work)) or one is already running, the run
   is skipped and the list says why. Only Docker Compose containers can be scheduled for update, and
   not when `UPDATE_CHECK=false`.
@@ -548,11 +558,13 @@ every month on a day you pick. Day 29 to 31 means the last day of a shorter mont
 - **Missed runs are not made up.** If Ratatosk was stopped, or the host asleep, more than 5 minutes
   past the time, that run is skipped and noted as missed. The next one happens as normal. Editing a
   schedule, switching it on or changing the timezone never runs it for a time that has already passed.
+  A list of containers that takes a long time does not make the schedules after it late.
 - **`READ_ONLY=true`** switches off creating and changing schedules, and any that are due are skipped
   and noted as such.
-- Ratatosk's own container can't be scheduled. A schedule follows the container's name, so it keeps
-  working after an update recreates the container; if the container is removed, the list marks the
-  schedule and each run fails with "no such container" until you delete it.
+- Ratatosk's own container can't be scheduled. A schedule follows each container's name, so it keeps
+  working after an update recreates the container; if a container is removed, the list marks the
+  schedule, and each run notes "no such container" for it (the others in the list still run) until
+  you remove the schedule.
 - Each run, skip and failure is in the **Debug** panel under `schedules`.
 
 ## Integrations

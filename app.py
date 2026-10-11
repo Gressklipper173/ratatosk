@@ -1878,20 +1878,86 @@ def _schedule_outcome(label, err, code, done):
     return f"failed: {err}"[:schedules.MAX_RESULT]
 
 
+UPDATE_WAIT = 2 * UPDATE_TIMEOUT + 60  # an update is a pull and an up, each with its own timeout
+
+
+def _wait_for_update(name):
+    """Block until this container's update job is over. Returns its error, or None when it
+    finished (a finished job removes itself; a failed one stays with its error)."""
+    deadline = time.monotonic() + UPDATE_WAIT
+    while True:
+        with _jobs_lock:
+            job = _jobs.get(name)
+        if job is None:
+            return None
+        if job["state"] != "running":
+            return job["error"]
+        if time.monotonic() > deadline:
+            return "timed out waiting for the update"
+        _schedule_stop.wait(2)
+
+
+def _summary(results):
+    """The one line the list shows for [(name, outcome)]: the outcome itself for a single
+    container, else the counts and what did not go through."""
+    if len(results) == 1:
+        return results[0][1]
+    bad = [(n, t) for n, t in results if t.startswith(("skipped", "failed"))]
+    parts = [f"{len(results) - len(bad)} done"]
+    for kind in ("skipped", "failed"):
+        count = sum(1 for _, t in bad if t.startswith(kind))
+        if count:
+            parts.append(f"{count} {kind}")
+    text = ", ".join(parts)
+    if bad:
+        text += " (" + "; ".join(f"{n}: {t.split(': ', 1)[-1]}" for n, t in bad) + ")"
+    return text[:schedules.MAX_RESULT]
+
+
 def _run_schedule(item):
-    """Do one scheduled action and return a short result for the list."""
-    name = item["container"]
-    label = f"scheduled {item['action']} of {name}"
+    """Do one scheduled action on each of its containers, one after another in the stored order,
+    and return a short result for the list. One that can't be done is noted and the rest go on."""
+    names = item["containers"]
     if READ_ONLY:
-        activity.log("warn", "schedules", f"{label} skipped: Ratatosk is in read-only mode")
+        activity.log("warn", "schedules", f"scheduled {item['action']} of {', '.join(names)} skipped: Ratatosk is in read-only mode")
         return "skipped: read-only mode"
-    if item["action"] == "restart":
-        err, code = run_container_action(name, "restart")
-        return _schedule_outcome(label, err, code, "restarted")
-    # an update needs the registry's newest answer, which may be up to half an hour old
-    check_registry()
-    err, code = start_update(name)
-    return _schedule_outcome(label, err, code, "update started")
+    if item["action"] == "update":
+        # an update needs the registry's newest answer, which may be up to half an hour old
+        check_registry()
+    results = []
+    for i, name in enumerate(names):
+        label = f"scheduled {item['action']} of {name}"
+        if item["action"] == "restart":
+            err, code = run_container_action(name, "restart")
+            text = _schedule_outcome(label, err, code, "restarted")
+        else:
+            err, code = start_update(name)
+            if err is None and i < len(names) - 1:
+                # the next one waits, so a database others rely on is back before they are touched
+                text = _schedule_outcome(label, _wait_for_update(name), 500, "updated")
+            else:
+                text = _schedule_outcome(label, err, code, "update started")
+        results.append((name, text))
+    return _summary(results)
+
+
+def _finish_due(item, slot, now, tz):
+    """Run one due schedule (or note that it was missed) and store how it went."""
+    if now - slot > SCHEDULE_GRACE:
+        result = f"missed: not running at {schedules.fmt(slot, tz)}"
+        activity.log("warn", "schedules", f"scheduled {item['action']} of {', '.join(item['containers'])} {result}")
+        ran = False
+    else:
+        result, ran = _run_schedule(item), True
+    with _data_lock:
+        data = load_schedules()
+        for stored in data["items"]:
+            if stored["id"] == item["id"]:
+                stored["last_result"] = result
+                if ran:
+                    stored["last_run"] = now
+                save_schedules(data)
+                break
 
 
 def run_due_schedules(now):
@@ -1912,21 +1978,12 @@ def run_due_schedules(now):
         if due:
             save_schedules(data)
     for item, slot in due:
-        if now - slot > SCHEDULE_GRACE:
-            result = f"missed: not running at {schedules.fmt(slot, tz)}"
-            activity.log("warn", "schedules", f"scheduled {item['action']} of {item['container']} {result}")
-            ran = False
+        if len(item["containers"]) > 1:
+            # a list can spend many minutes waiting for updates; on its own thread it does not make
+            # the schedules after it late (and so "missed")
+            threading.Thread(target=_finish_due, args=(item, slot, now, tz), daemon=True).start()
         else:
-            result, ran = _run_schedule(item), True
-        with _data_lock:
-            data = load_schedules()
-            for stored in data["items"]:
-                if stored["id"] == item["id"]:
-                    stored["last_result"] = result
-                    if ran:
-                        stored["last_run"] = now
-                    save_schedules(data)
-                    break
+            _finish_due(item, slot, now, tz)
 
 
 def _scheduler():
@@ -1941,30 +1998,42 @@ def _scheduler():
 
 def _schedule_view(item, tz, now, names):
     nxt = schedules.next_slot(item, tz, now) if item["enabled"] else None
-    shown = {k: item[k] for k in ("id", "container", "action", "freq", "time", "weekday", "monthday", "enabled", "last_result")}
+    shown = {k: item[k] for k in ("id", "containers", "action", "freq", "time", "weekday", "monthday", "enabled", "last_result")}
+    missing = [] if names is None else [n for n in item["containers"] if n not in names]
     return {
         **shown,
         "next_run": schedules.fmt(nxt, tz),
         "last_run": schedules.fmt(item["last_run"], tz),
-        "container_exists": names is None or item["container"] in names,
+        "container_exists": not missing,
+        "missing": missing,
     }
 
 
-def _schedule_target_error(fields):
+def _container_error(name, action):
     """Why this container can't take this scheduled action, or None."""
     try:
-        c = docker_client.containers.get(fields["container"])
+        c = docker_client.containers.get(name)
     except docker.errors.NotFound:
         return "no such container"
     except docker.errors.DockerException as e:
         return str(e)
     if is_self(c):
         return "Ratatosk can't control its own container"
-    if fields["action"] == "update":
+    if action == "update":
         if not UPDATE_CHECK:
             return "updates are switched off"
         if compose_info(c.attrs.get("Config", {}).get("Labels") or {}) is None:
             return "only Docker Compose containers can be updated"
+    return None
+
+
+def _schedule_target_error(fields, names=None):
+    """Why a container of this schedule can't take its action, or None. `names` narrows the
+    check to some of the containers (the ones an edit added)."""
+    for name in fields["containers"] if names is None else names:
+        err = _container_error(name, fields["action"])
+        if err:
+            return f"{name}: {err}" if len(fields["containers"]) > 1 else err
     return None
 
 
@@ -2031,8 +2100,11 @@ def api_schedule(sid):
             save_schedules(data)
             return jsonify({"error": None})
         fields, err = schedules.validate(body, base=item)
-        if not err and (fields["container"], fields["action"]) != (item["container"], item["action"]):
-            err = _schedule_target_error(fields)
+        if not err:
+            # a new action means every container is checked again; otherwise only the ones added
+            added = None if fields["action"] != item["action"] else [n for n in fields["containers"] if n not in item["containers"]]
+            if added is None or added:
+                err = _schedule_target_error(fields, added)
         if err:
             return jsonify({"error": err}), 400
         item.update(fields)

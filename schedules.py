@@ -3,9 +3,12 @@
 Pure functions with no Flask or Docker in them, so the date maths can be tested with a fixed
 clock. A schedule item is a dict:
 
-    id, container, action ("restart" | "update"), freq ("daily" | "weekly" | "monthly"),
-    time ("HH:MM", in the server timezone), weekday (0 = Monday .. 6, weekly only),
-    monthday (1..31, monthly only), enabled, last_slot, last_run, last_result
+    id, containers (names, in the order they run), action ("restart" | "update"),
+    freq ("daily" | "weekly" | "monthly"), time ("HH:MM", in the server timezone),
+    weekday (0 = Monday .. 6, weekly only), monthday (1..31, monthly only), enabled,
+    last_slot, last_run, last_result
+
+An older file (or client) names one container as `container`; it reads as a list of one.
 
 `last_slot` is the newest slot (epoch seconds) that has been dealt with, whether it ran or was
 skipped. The scheduler compares it with `prev_slot()`, so a slot is handled once, and one that
@@ -19,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 ACTIONS = ("restart", "update")
 FREQS = ("daily", "weekly", "monthly")
 MAX_ITEMS = 100
+MAX_CONTAINERS = 50  # in one schedule
 MAX_RESULT = 200
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")  # Docker's own rule for a container name
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
@@ -99,15 +103,25 @@ def fmt(epoch, tz):
 def validate(data, base=None):
     """Check a schedule submitted by the page. `base` is the stored item being edited, whose
     values fill in what the page left out. Returns (fields, error); fields hold only what the
-    page may set (container, action, freq, time, weekday, monthday, enabled)."""
+    page may set (containers, action, freq, time, weekday, monthday, enabled)."""
     if not isinstance(data, dict):
         return None, "expected an object"
-    merged = {k: (base or {}).get(k) for k in ("container", "action", "freq", "time", "weekday", "monthday", "enabled")}
+    data = dict(data)
+    # the older single-container spelling, from a file written before lists or a client that sends it
+    if "containers" not in data and "container" in data:
+        data["containers"] = [data["container"]]
+    merged = {k: (base or {}).get(k) for k in ("containers", "action", "freq", "time", "weekday", "monthday", "enabled")}
     merged.update({k: data[k] for k in merged if k in data})
     if merged["enabled"] is None:
         merged["enabled"] = True
-    if not isinstance(merged["container"], str) or not NAME_RE.match(merged["container"]):
-        return None, "choose a container"
+    names = merged["containers"]
+    if not isinstance(names, list) or not names or not all(isinstance(n, str) and NAME_RE.match(n) for n in names):
+        return None, "choose at least one container"
+    if len(set(names)) != len(names):
+        return None, "a container is listed twice"
+    if len(names) > MAX_CONTAINERS:
+        return None, f"at most {MAX_CONTAINERS} containers in one schedule"
+    merged["containers"] = list(names)
     if merged["action"] not in ACTIONS:
         return None, "action must be restart or update"
     if merged["freq"] not in FREQS:

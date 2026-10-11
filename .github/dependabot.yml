@@ -9,5 +9,14 @@ updates:
       interval: weekly
   - package-ecosystem: docker
     directory: /
+    # Official images re-push a version tag when they rebuild it, which shows up here as a new
+    # digest for the same version. Monthly batches those.
     schedule:
-      interval: weekly
+      interval: monthly
+    ignore:
+      # Stay on the Python minor version the tests and the README name (3.12). Patch releases still
+      # come through; moving to a new minor is a deliberate change to the CI files too.
+      - dependency-name: python
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor

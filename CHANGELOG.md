@@ -29,8 +29,10 @@ First public version.
   - Writes to the users and keys files are serialised and use a unique temporary file.
   - Dependencies are locked with hashes (`requirements.in` → `requirements.txt`, Flask 3.1.3 and
     gunicorn 23.0.0) and the base images are pinned by digest.
-- Schedules (admins): restart or update a container at a time of day, daily, weekly or monthly, from
-  **Schedule…** in a container's menu or **Settings → Schedules**. One timezone, picked in Settings; a run
+- Schedules (admins): restart or update containers at a time of day, daily, weekly or monthly, from
+  **Schedule…** in a container's menu or **Settings → Schedules**. A schedule can hold a list of up to
+  50 containers that run one after another in the order you set, each update waiting for the one before
+  it, and a failure does not stop the rest. One timezone, picked in Settings; a run
   missed while Ratatosk was off is skipped and logged; `READ_ONLY` skips them. Adds the `tzdata`
   package to the locked requirements and `schedules.py` to the image.
 - **Settings → Updates → Check for updates now** (admins) checks every Compose container's registry on

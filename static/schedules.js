@@ -67,13 +67,66 @@
       .sort((a, b) => a[1].localeCompare(b[1]));
   }
 
-  // The add form. opts: container (fixed container name, else a picker is shown), names (the
-  // picker's [value, label] pairs), updateCheck, readOnly, note (a line above the fields),
+  // The containers of a new schedule: a list that is built by adding from the choices, kept in the
+  // order they will run, with buttons to move or remove each one. get() is the names in order.
+  function containerPicker(names) {
+    const labels = new Map(names);
+    let chosen = [];
+    let locked = false;
+    const node = el("div", "sched-picks");
+    const list = el("ol", "sched-chosen");
+    const pick = el("select");
+    pick.setAttribute("aria-label", "Container to add");
+    const add = el("button", "mini", "Add");
+    add.type = "button";
+    const row = el("div", "sched-addrow");
+    row.append(pick, add);
+    const hint = el("p", "int-note", "Containers run one after another, top to bottom.");
+    node.append(list, row, hint);
+
+    function draw() {
+      list.replaceChildren(...chosen.map((name, i) => {
+        const li = el("li", "");
+        li.append(el("span", "sched-name", labels.get(name) || name));
+        for (const [text, word, step] of [["↑", "earlier", -1], ["↓", "later", 1]]) {
+          const b = el("button", "mini", text);
+          b.type = "button";
+          b.setAttribute("aria-label", `Move ${name} ${word}`);
+          b.disabled = locked || i + step < 0 || i + step >= chosen.length;
+          b.addEventListener("click", () => { chosen = window.EditLogic.moveItem(chosen, i, step); draw(); });
+          li.append(b);
+        }
+        const remove = el("button", "mini", "Remove");
+        remove.type = "button";
+        remove.setAttribute("aria-label", `Remove ${name}`);
+        remove.disabled = locked;
+        remove.addEventListener("click", () => { chosen = chosen.filter((n) => n !== name); draw(); });
+        li.append(remove);
+        return li;
+      }));
+      list.hidden = !chosen.length;
+      const rest = names.filter(([v]) => !chosen.includes(v));
+      pick.replaceChildren(...rest.map(([v, text]) => {
+        const o = el("option", "", text);
+        o.value = v;
+        return o;
+      }));
+      pick.disabled = add.disabled = locked || !rest.length;
+    }
+    add.addEventListener("click", () => {
+      if (pick.value) { chosen = [...chosen, pick.value]; draw(); }
+    });
+    draw();
+    return { node, get: () => chosen.slice(), lock(flag) { locked = flag; draw(); } };
+  }
+
+  // The add form. opts: container (fixed container name, else a picker for several is shown), names
+  // (the picker's [value, label] pairs), updateCheck, readOnly, note (a line above the fields),
   // onDone(text) after a schedule was saved.
   function scheduleForm(opts) {
     const form = el("form", "sched-form");
     const msg = status();
-    const container = opts.container ? null : select(opts.names || [], (opts.names || [])[0]?.[0] || "", "Container");
+    const picker = opts.container ? null : containerPicker(opts.names || []);
     const action = select([["restart", "Restart"], ["update", "Update"]], "restart", "Action");
     const freq = select(Object.entries(FREQ_TEXT), "daily", "Repeat");
     const weekday = select(WEEKDAYS.map((d, i) => [String(i), d]), "0", "Weekday");
@@ -99,22 +152,24 @@
     sync();
 
     if (opts.note) form.append(el("p", "int-note sched-wide", opts.note));
-    form.append(...[container, action, freq, weekday, monthday, el("span", "sched-at", "at"), time, add].filter(Boolean), monthNote, msg.node);
+    if (picker) form.append(picker.node);
+    form.append(action, freq, weekday, monthday, el("span", "sched-at", "at"), time, add, monthNote, msg.node);
     if (opts.readOnly || readOnlyMode()) {
-      for (const b of [container, action, freq, weekday, monthday, time, add].filter(Boolean)) { b.disabled = true; b.title = "Ratatosk is read-only"; }
+      for (const b of [action, freq, weekday, monthday, time, add]) { b.disabled = true; b.title = "Ratatosk is read-only"; }
+      picker?.lock(true);
     }
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       if (!time.value) { msg.show("Choose a time.", true); return; }
-      const body = { container: opts.container || container?.value, action: action.value, freq: freq.value, time: time.value };
-      if (!body.container) { msg.show("Choose a container.", true); return; }
+      const body = { containers: opts.container ? [opts.container] : picker.get(), action: action.value, freq: freq.value, time: time.value };
+      if (!body.containers.length) { msg.show("Choose at least one container.", true); return; }
       if (freq.value === "weekly") body.weekday = Number(weekday.value);
       if (freq.value === "monthly") body.monthday = Number(monthday.value);
       add.disabled = true;
       const res = await call("/api/schedules", "POST", body);
       add.disabled = false;
       if (res.error) { msg.show(res.error, true); return; }
-      opts.onDone?.(`Scheduled: ${ACTION_TEXT[body.action].toLowerCase()} ${body.container} ${describe(body)}.`);
+      opts.onDone?.(`Scheduled: ${ACTION_TEXT[body.action].toLowerCase()} ${body.containers.join(", ")} ${describe(body)}.`);
     });
     return form;
   }
@@ -123,16 +178,24 @@
   function scheduleRow(it, msg, reload) {
     const row = el("li", "sched-row");
     const what = el("span", "sched-what");
-    what.append(el("span", "", `${ACTION_TEXT[it.action]} ${it.container}`), el("small", "", describe(it)));
+    const title = `${ACTION_TEXT[it.action]} ${window.EditLogic.containerTitle(it.containers)}`;
+    what.append(el("span", "", title));
+    if (it.containers.length > 1) what.append(el("small", "", it.containers.join(" → ")));
+    what.append(el("small", "", describe(it)));
     const when = it.enabled ? (it.next_run ? `Next: ${it.next_run}` : "") : "Paused";
     if (when) what.append(el("small", "", when));
     if (it.last_result) what.append(el("small", "", `Last: ${it.last_run ? it.last_run + " – " : ""}${it.last_result}`));
-    if (!it.container_exists) what.append(el("small", "sched-gone", "This container no longer exists, so nothing runs."));
+    if (!it.container_exists) {
+      const rest = it.containers.length > it.missing.length;
+      what.append(el("small", "sched-gone", it.containers.length === 1
+        ? "This container no longer exists, so nothing runs."
+        : `No longer exists: ${it.missing.join(", ")}.${rest ? " The others still run." : " So nothing runs."}`));
+    }
 
     const on = el("input");
     on.type = "checkbox";
     on.checked = it.enabled;
-    on.setAttribute("aria-label", `Enabled: ${ACTION_TEXT[it.action].toLowerCase()} ${it.container}`);
+    on.setAttribute("aria-label", `Enabled: ${title.toLowerCase()}`);
     on.addEventListener("change", async () => {
       const res = await call(`/api/schedules/${encodeURIComponent(it.id)}`, "PUT", { enabled: on.checked });
       msg.show(res.error || (on.checked ? "Schedule on." : "Schedule paused."), !!res.error);
@@ -143,7 +206,7 @@
     const remove = el("button", "mini", "Delete");
     remove.type = "button";
     remove.addEventListener("click", async () => {
-      if (!confirm(`Delete the schedule "${ACTION_TEXT[it.action].toLowerCase()} ${it.container}, ${describe(it)}"?`)) return;
+      if (!confirm(`Delete the schedule "${title.toLowerCase()}, ${describe(it)}"?`)) return;
       const res = await call(`/api/schedules/${encodeURIComponent(it.id)}`, "DELETE");
       msg.show(res.error || "Schedule deleted.", !!res.error);
       reload();

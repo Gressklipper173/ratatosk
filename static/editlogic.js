@@ -1,6 +1,6 @@
 // Pure helpers for the page (no DOM, no network), kept apart so Node can test them: putting a file's
-// line endings back after a raw edit, checking a group name, running a task one at a time, and
-// finding a timezone by what was typed.
+// line endings back after a raw edit, checking a group name, running a task one at a time,
+// finding a timezone by what was typed, and ordering a schedule's list of containers.
 // Loaded before app.js; also usable from Node (see tests/js/editlogic.test.mjs).
 
 (function (root) {
@@ -100,7 +100,23 @@
     return out.slice(0, limit).map((x) => x.name);
   }
 
-  const api = { MAX_GROUP_NAME, lineEnding, restoreEol, groupNameProblem, coalesce, updateCheckSummary, tzMatches };
+  // A copy of `list` with the entry at `index` moved `step` places (negative is earlier). It stops at
+  // the ends instead of wrapping round, and an index that is not in the list changes nothing.
+  function moveItem(list, index, step) {
+    const out = list.slice();
+    const to = index + step;
+    if (!Number.isInteger(index) || index < 0 || index >= out.length || to < 0 || to >= out.length) return out;
+    const [entry] = out.splice(index, 1);
+    out.splice(to, 0, entry);
+    return out;
+  }
+
+  // What a schedule calls its containers in a heading: the name for one, a count for several.
+  function containerTitle(names) {
+    return names.length === 1 ? names[0] : `${names.length} containers`;
+  }
+
+  const api = { MAX_GROUP_NAME, lineEnding, restoreEol, groupNameProblem, coalesce, updateCheckSummary, tzMatches, moveItem, containerTitle };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.EditLogic = api;
 })(typeof window !== "undefined" ? window : globalThis);

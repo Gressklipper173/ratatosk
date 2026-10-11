@@ -213,3 +213,30 @@ test("nothing typed gives everything up to the limit; nothing matching gives not
   assert.deepEqual(E.tzMatches(ZONES, "zzz", 10), []);
   assert.deepEqual(E.tzMatches(ZONES, "utc", 10), ["UTC"]);
 });
+
+// ---- moveItem and containerTitle (a schedule's list of containers)
+
+test("moveItem moves one entry and leaves the original list alone", () => {
+  const list = ["db", "app", "web"];
+  assert.deepEqual(E.moveItem(list, 2, -1), ["db", "web", "app"]);
+  assert.deepEqual(E.moveItem(list, 0, 1), ["app", "db", "web"]);
+  assert.deepEqual(E.moveItem(list, 0, 2), ["app", "web", "db"]);
+  assert.deepEqual(list, ["db", "app", "web"]);
+});
+
+test("moveItem stops at the ends and ignores a bad index", () => {
+  const list = ["db", "app", "web"];
+  assert.deepEqual(E.moveItem(list, 0, -1), list);
+  assert.deepEqual(E.moveItem(list, 2, 1), list);
+  assert.deepEqual(E.moveItem(list, 5, -1), list);
+  assert.deepEqual(E.moveItem(list, -1, 1), list);
+  assert.deepEqual(E.moveItem(list, 0.5, 1), list);
+  assert.deepEqual(E.moveItem([], 0, 1), []);
+  assert.notEqual(E.moveItem(list, 0, -1), list); // always a copy
+});
+
+test("containerTitle names one container and counts several", () => {
+  assert.equal(E.containerTitle(["db"]), "db");
+  assert.equal(E.containerTitle(["db", "app"]), "2 containers");
+  assert.equal(E.containerTitle(["a", "b", "c", "d", "e"]), "5 containers");
+});

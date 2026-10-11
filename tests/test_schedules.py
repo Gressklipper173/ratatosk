@@ -101,7 +101,7 @@ def test_timezone_list_has_utc_and_real_zones():
 
 
 def base(**kw):
-    return {"container": "web", "action": "restart", "freq": "daily", "time": "03:00", **kw}
+    return {"containers": ["web"], "action": "restart", "freq": "daily", "time": "03:00", **kw}
 
 
 def test_valid_schedules_keep_only_the_day_that_applies():
@@ -116,9 +116,12 @@ def test_valid_schedules_keep_only_the_day_that_applies():
 @pytest.mark.parametrize(
     "bad",
     [
-        {"container": ""},
-        {"container": "../etc"},
-        {"container": 5},
+        {"containers": [""]},
+        {"containers": ["../etc"]},
+        {"containers": [5]},
+        {"containers": "web"},
+        {"containers": []},
+        {"containers": ["web", "web"]},
         {"action": "stop"},
         {"freq": "hourly"},
         {"time": "3:00"},
@@ -145,7 +148,7 @@ def test_validate_rejects_non_objects():
 
 
 def test_validate_fills_gaps_from_the_stored_item():
-    stored = {"container": "web", "action": "restart", "freq": "weekly", "time": "03:00", "weekday": 1, "monthday": None, "enabled": True}
+    stored = {"containers": ["web"], "action": "restart", "freq": "weekly", "time": "03:00", "weekday": 1, "monthday": None, "enabled": True}
     f, err = schedules.validate({"enabled": False}, base=stored)
     assert err is None and f["enabled"] is False and f["weekday"] == 1
 
@@ -174,7 +177,7 @@ def test_create_list_edit_delete(env, logged_in):
     assert r.status_code == 201
     sid = r.get_json()["id"]
     [it] = c.get("/api/schedules").get_json()["items"]
-    assert it["id"] == sid and it["container"] == "web" and it["action"] == "restart" and it["freq"] == "weekly"
+    assert it["id"] == sid and it["containers"] == ["web"] and it["action"] == "restart" and it["freq"] == "weekly"
     assert it["next_run"] and it["last_run"] == "" and it["container_exists"] is True
     # an edit may send only what changed
     assert c.put(f"/api/schedules/{sid}", json={"time": "05:15"}, headers=hdr(csrf)).status_code == 200
@@ -195,14 +198,14 @@ def test_create_refusals(env, logged_in, monkeypatch):
     env.client.add(FakeContainer("dashboard", short_id="dashboardself"))
     assert c.post("/api/schedules", json=base()).status_code == 403  # no csrf
     assert create(c, csrf, time="nope").status_code == 400
-    assert create(c, csrf, container="ghost").status_code == 400
-    assert "Ratatosk" in create(c, csrf, container="dashboard").get_json()["error"]
+    assert create(c, csrf, containers=["ghost"]).status_code == 400
+    assert "Ratatosk" in create(c, csrf, containers=["dashboard"]).get_json()["error"]
     assert "Compose" in create(c, csrf, action="update").get_json()["error"]  # web is not a Compose container
     monkeypatch.setattr(env.app, "UPDATE_CHECK", False)
     env.client.add(FakeContainer("comp", labels=COMPOSE))
-    assert "switched off" in create(c, csrf, container="comp", action="update").get_json()["error"]
+    assert "switched off" in create(c, csrf, containers=["comp"], action="update").get_json()["error"]
     monkeypatch.setattr(env.app, "UPDATE_CHECK", True)
-    assert create(c, csrf, container="comp", action="update").status_code == 201
+    assert create(c, csrf, containers=["comp"], action="update").status_code == 201
     assert c.post("/api/schedules", data="not json", headers=hdr(csrf)).status_code == 400
     monkeypatch.setattr(env.app.schedules, "MAX_ITEMS", 1)
     assert create(c, csrf).status_code == 400
@@ -271,7 +274,7 @@ def test_a_container_that_is_gone_is_flagged(env, logged_in):
     create(c, csrf)
     del env.client.by_name["web"]
     [it] = c.get("/api/schedules").get_json()["items"]
-    assert it["container_exists"] is False
+    assert it["container_exists"] is False and it["missing"] == ["web"]
 
 
 # ---- the scheduler ---------------------------------------------------------
@@ -379,7 +382,7 @@ def test_a_missing_container_is_recorded_as_failed(env):
 
 def test_ratatosk_itself_is_skipped(env):
     me = env.client.add(FakeContainer("dashboard", short_id="dashboardself"))
-    seed(env, container="dashboard")
+    seed(env, containers=["dashboard"])
     env.app.run_due_schedules(SLOT + 5)
     assert me.calls == [] and stored(env)["last_result"].startswith("skipped")
 
@@ -462,3 +465,221 @@ def test_the_loop_runs_each_tick_and_survives_an_error(env, monkeypatch):
     env.app._scheduler()
     assert len(seen) == 2 and waits == [env.app.SCHEDULE_TICK] * 2
     assert any("scheduler error: RuntimeError: boom" in e["msg"] for e in env.app.activity.snapshot()[0])
+
+
+# ---- several containers in one schedule --------------------------------------
+
+
+def test_a_list_keeps_its_order_and_the_older_spelling_reads_as_a_list():
+    f, err = schedules.validate(base(containers=["db", "app", "web"]))
+    assert err is None and f["containers"] == ["db", "app", "web"]
+    legacy = {"container": "web", "action": "restart", "freq": "daily", "time": "03:00"}
+    f, err = schedules.validate(legacy)
+    assert err is None and f["containers"] == ["web"] and "container" not in f
+    # a client that still sends one name changes the list to that one
+    f, err = schedules.validate({"container": "db"}, base=base(containers=["web", "app"]))
+    assert err is None and f["containers"] == ["db"]
+
+
+def test_too_many_containers_are_refused(monkeypatch):
+    monkeypatch.setattr(schedules, "MAX_CONTAINERS", 2)
+    assert schedules.validate(base(containers=["a", "b"]))[1] is None
+    assert "at most 2" in schedules.validate(base(containers=["a", "b", "c"]))[1]
+
+
+def test_a_file_from_before_lists_still_loads(env, logged_in):
+    c, csrf = logged_in
+    env.client.add(FakeContainer("web"))
+    old = {"id": "s1", "container": "web", "action": "restart", "freq": "daily", "time": "03:00", "enabled": True,
+           "last_slot": 5, "last_run": None, "last_result": ""}
+    with open(env.app.SCHEDULES_PATH, "w") as f:
+        json.dump({"timezone": "UTC", "items": [old]}, f)
+    [it] = c.get("/api/schedules").get_json()["items"]
+    assert it["containers"] == ["web"] and "container" not in it
+    # the next save writes the new spelling
+    assert c.put("/api/schedules/s1", json={"enabled": False}, headers=hdr(csrf)).status_code == 200
+    with open(env.app.SCHEDULES_PATH) as f:
+        saved = json.load(f)["items"][0]
+    assert saved["containers"] == ["web"] and "container" not in saved
+
+
+def test_create_and_edit_a_list(env, logged_in):
+    c, csrf = logged_in
+    for n in ("db", "app", "web"):
+        env.client.add(FakeContainer(n))
+    r = create(c, csrf, containers=["db", "app"])
+    assert r.status_code == 201
+    sid = r.get_json()["id"]
+    [it] = c.get("/api/schedules").get_json()["items"]
+    assert it["containers"] == ["db", "app"] and it["missing"] == []
+    # reordering and adding are edits; only the added container is looked at
+    assert c.put(f"/api/schedules/{sid}", json={"containers": ["app", "db", "web"]}, headers=hdr(csrf)).status_code == 200
+    assert c.get("/api/schedules").get_json()["items"][0]["containers"] == ["app", "db", "web"]
+    bad = c.put(f"/api/schedules/{sid}", json={"containers": ["app", "ghost"]}, headers=hdr(csrf))
+    assert bad.status_code == 400 and bad.get_json()["error"] == "ghost: no such container"
+    # a container that has gone since does not stop other edits to the schedule
+    del env.client.by_name["db"]
+    assert c.put(f"/api/schedules/{sid}", json={"time": "04:00"}, headers=hdr(csrf)).status_code == 200
+    [it] = c.get("/api/schedules").get_json()["items"]
+    assert it["missing"] == ["db"] and it["container_exists"] is False
+
+
+def test_a_refusal_in_a_list_names_the_container(env, logged_in):
+    c, csrf = logged_in
+    env.client.add(FakeContainer("web"))
+    r = create(c, csrf, containers=["web", "ghost"])
+    assert r.status_code == 400 and r.get_json()["error"] == "ghost: no such container"
+    env.client.add(FakeContainer("comp", labels=COMPOSE))
+    r = create(c, csrf, containers=["comp", "web"], action="update")
+    assert r.status_code == 400 and r.get_json()["error"].startswith("web: only Docker Compose")
+
+
+def add_many(env, *names):
+    boxes = [env.client.add(FakeContainer(n)) for n in names]
+    order = []
+    for box in boxes:
+        box.restart = lambda timeout=None, box=box: order.append(box.name)
+    return boxes, order
+
+
+def test_a_list_restarts_in_order_on_its_own_thread(env, monkeypatch):
+    boxes, order = add_many(env, "db", "app", "web")
+    seed(env, containers=["db", "app", "web"])
+    started = []
+    thread = lambda target, args, daemon: SimpleNamespace(start=lambda: started.append((target, args)))
+    monkeypatch.setattr(env.app, "threading", SimpleNamespace(Thread=thread))
+    env.app.run_due_schedules(SLOT + 5)
+    # handed to a thread, so the scheduler is free to look at the next schedule
+    assert order == [] and len(started) == 1 and stored(env)["last_result"] == ""
+    target, args = started[0]
+    target(*args)
+    assert order == ["db", "app", "web"]
+    it = stored(env)
+    assert it["last_result"] == "3 done" and it["last_run"] == SLOT + 5
+
+
+def test_a_single_container_still_runs_in_the_scheduler_itself(env, monkeypatch):
+    web = env.client.add(FakeContainer("web"))
+    seed(env)
+    monkeypatch.setattr(env.app, "threading", SimpleNamespace(Thread=lambda **kw: pytest.fail("no thread for one container")))
+    env.app.run_due_schedules(SLOT + 5)
+    assert web.calls == ["restart"]
+
+
+def test_one_failure_does_not_stop_the_rest(env, monkeypatch):
+    boxes, order = add_many(env, "db", "app", "web")
+
+    def boom(timeout=None):
+        raise docker.errors.APIError("daemon unhappy")
+
+    boxes[1].restart = boom
+    seed(env, containers=["db", "app", "ghost", "web"])
+    run_threads_inline(env, monkeypatch)
+    env.app.run_due_schedules(SLOT + 5)
+    assert order == ["db", "web"]
+    result = stored(env)["last_result"]
+    assert result.startswith("2 done, 2 failed (app: ") and "daemon unhappy" in result and "ghost: no such container" in result
+    assert len(result) <= schedules.MAX_RESULT
+    assert any("scheduled restart of ghost failed" in e["msg"] for e in env.app.activity.snapshot()[0])
+
+
+def test_a_missed_list_is_logged_with_its_containers(env):
+    boxes, order = add_many(env, "db", "app")
+    seed(env, containers=["db", "app"])
+    env.app.run_due_schedules(SLOT + env.app.SCHEDULE_GRACE + 1)  # a list is handed to a real thread
+    for _ in range(100):
+        if stored(env)["last_result"]:
+            break
+        env.app.time.sleep(0.05)
+    assert order == [] and stored(env)["last_result"].startswith("missed")
+    assert any("scheduled restart of db, app missed" in e["msg"] for e in env.app.activity.snapshot()[0])
+
+
+def test_a_list_in_read_only_mode_is_skipped_once(env, monkeypatch):
+    boxes, order = add_many(env, "db", "app")
+    seed(env, containers=["db", "app"])
+    monkeypatch.setattr(env.app, "READ_ONLY", True)
+    run_threads_inline(env, monkeypatch)
+    env.app.run_due_schedules(SLOT + 5)
+    assert order == [] and stored(env)["last_result"] == "skipped: read-only mode"
+
+
+def test_the_summary_line(env):
+    summary = env.app._summary
+    assert summary([("web", "restarted")]) == "restarted"
+    assert summary([("web", "skipped: no update available")]) == "skipped: no update available"
+    assert summary([("a", "restarted"), ("b", "update started")]) == "2 done"
+    assert summary([("a", "restarted"), ("b", "failed: x"), ("c", "skipped: y")]) == "1 done, 1 skipped, 1 failed (b: x; c: y)"
+    assert len(summary([(f"c{i}", "failed: " + "x" * 50) for i in range(20)])) <= schedules.MAX_RESULT
+
+
+def add_two(env, local="sha256:old", latest="sha256:new"):
+    env.client.add(FakeContainer("web", labels=COMPOSE, image_ref="app:1", repo_digests=[f"app@{local}"]))
+    env.client.add(FakeContainer("db", labels={**COMPOSE, "com.docker.compose.service": "db"}, image_ref="db:1", repo_digests=[f"db@{local}"]))
+    env.client.registry["app:1"] = latest
+    env.client.registry["db:1"] = latest
+    env.app._registry.clear()
+
+
+def fake_compose(env, monkeypatch, fail=None):
+    monkeypatch.setattr(env.app.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(env.app.shutil, "which", lambda n: "/usr/bin/docker")
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        if fail and fail in cmd and "pull" in cmd:
+            return SimpleNamespace(returncode=1, stdout="", stderr="pull access denied")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(env.app.subprocess, "run", run)
+    return calls
+
+
+def test_a_list_of_updates_goes_one_after_another(env, monkeypatch):
+    add_two(env)
+    seed(env, action="update", containers=["db", "web"])
+    calls = fake_compose(env, monkeypatch)
+    run_threads_inline(env, monkeypatch)
+    env.app.run_due_schedules(SLOT + 5)
+    assert [c[-1] for c in calls] == ["db", "db", "web", "web"]
+    assert stored(env)["last_result"] == "2 done"
+
+
+def test_a_failed_update_in_a_list_is_reported_and_the_next_still_runs(env, monkeypatch):
+    add_two(env)
+    seed(env, action="update", containers=["web", "db"])
+    calls = fake_compose(env, monkeypatch, fail="web")
+    run_threads_inline(env, monkeypatch)
+    env.app.run_due_schedules(SLOT + 5)
+    assert [c[-1] for c in calls] == ["web", "db", "db"]  # web stopped after its pull
+    assert stored(env)["last_result"] == "1 done, 1 failed (web: pull access denied)"
+
+
+def test_an_update_with_nothing_new_is_skipped_inside_a_list(env, monkeypatch):
+    add_two(env, latest="sha256:old")
+    seed(env, action="update", containers=["web", "db"])
+    calls = fake_compose(env, monkeypatch)
+    run_threads_inline(env, monkeypatch)
+    env.app.run_due_schedules(SLOT + 5)
+    assert calls == [] and stored(env)["last_result"] == "0 done, 2 skipped (web: no update available; db: no update available)"
+
+
+def test_waiting_for_an_update_job(env, monkeypatch):
+    wait = env.app._wait_for_update
+    assert wait("nobody") is None  # no job: nothing running, nothing to wait for
+    env.app._jobs["x"] = {"state": "error", "error": "boom"}
+    assert wait("x") == "boom"
+    env.app._jobs["x"] = {"state": "running", "error": None}
+    ticks = []
+
+    def tick(t):
+        ticks.append(t)
+        if len(ticks) == 2:
+            del env.app._jobs["x"]
+
+    monkeypatch.setattr(env.app._schedule_stop, "wait", tick)
+    assert wait("x") is None and ticks == [2, 2]
+    env.app._jobs["x"] = {"state": "running", "error": None}
+    monkeypatch.setattr(env.app, "UPDATE_WAIT", -1)
+    assert wait("x") == "timed out waiting for the update"
