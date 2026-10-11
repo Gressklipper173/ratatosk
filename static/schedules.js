@@ -99,7 +99,10 @@
     node.append(fieldset, order);
 
     function draw() {
-      list.replaceChildren(...chosen.map((name, i) => {
+      if (!chosen.length) {
+        // the box is always there at the same size, so ticking never moves the rest of the dialog
+        list.replaceChildren(el("li", "sched-placeholder", "Nothing ticked yet."));
+      } else list.replaceChildren(...chosen.map((name, i) => {
         const li = el("li", "");
         li.append(el("span", "sched-name", labels.get(name) || name));
         for (const [text, word, step] of [["↑", "earlier", -1], ["↓", "later", 1]]) {
@@ -112,8 +115,6 @@
         }
         return li;
       }));
-      // one container has no order to fix
-      order.hidden = chosen.length < 2;
       for (const box of boxes.values()) box.disabled = locked;
     }
     draw();
