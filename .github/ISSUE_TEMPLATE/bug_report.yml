@@ -1,0 +1,44 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. For a **security** problem, do not open an issue: use the private
+        report link on the issue chooser page or see [SECURITY.md](https://github.com/Gressklipper173/ratatosk/blob/main/SECURITY.md).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Ratatosk version
+      description: Shown in **Settings**.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: How you run it
+      description: Reverse proxy or direct, `READ_ONLY`, `BEHIND_PROXY`, Docker and Compose versions, host OS. Paste your compose file with anything private removed.
+    validations:
+      required: true
+  - type: textarea
+    id: debug
+    attributes:
+      label: Debug panel output
+      description: |
+        Open **Debug** and paste the lines around the problem. It never records keys or passwords,
+        but check it for container names and addresses you would rather not share.
+      render: text
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Screenshots, browser, what you already tried.

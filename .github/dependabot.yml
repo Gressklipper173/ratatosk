@@ -1,0 +1,13 @@
+# Actions and base images are pinned by SHA/digest, so something has to move them forward.
+# Python packages are not listed: requirements.txt is generated with hashes by pip-compile
+# (see CONTRIBUTING.md), which Dependabot would not keep in step.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

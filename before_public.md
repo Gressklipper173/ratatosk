@@ -11,8 +11,6 @@ Nothing here blocks a private repo. Work through it before changing the visibili
       a public history can't be taken back.
 - [ ] **Re-run the personal-strings search** on the final tree: hostnames, home paths, the tailnet name,
       private IPs, emails, keys, hashes. `PLAN.md` must stay out of the repo.
-- [ ] **Rotate the old stack's exposed keys.** The old stack's notes contain a plaintext qBittorrent
-      password and a Seerr API key. They must not reach this project, and should be rotated anyway.
 - [x] **`SECURITY.md`.** How to report a vulnerability privately (GitHub private reporting or an
       address), and what is supported. This tool holds the Docker socket, so it matters more than usual.
 - [ ] **README polish.** Screenshots (light and dark, phone and desktop), a one-line pitch next to the

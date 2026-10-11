@@ -1,0 +1,43 @@
+name: Support for a new app
+description: Ask for, or offer, an adapter for an app
+labels: [adapter]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most apps need only a YAML file, no code. See
+        [docs/ADAPTERS.md](https://github.com/Gressklipper173/ratatosk/blob/main/docs/ADAPTERS.md); a pull request with the file and its
+        tests is the quickest route.
+  - type: input
+    id: app
+    attributes:
+      label: App and version
+      placeholder: "Name, version, link to its API docs"
+    validations:
+      required: true
+  - type: textarea
+    id: want
+    attributes:
+      label: What the panel should show
+      description: Which numbers or lists, and which API calls give them.
+    validations:
+      required: true
+  - type: dropdown
+    id: auth
+    attributes:
+      label: How the app signs requests in
+      options:
+        - API key in a header
+        - API key in the URL
+        - Username and password (login call)
+        - Key kept in a file in the container
+        - No sign-in
+        - Not sure
+    validations:
+      required: true
+  - type: checkboxes
+    id: offer
+    attributes:
+      label: Contributing
+      options:
+        - label: I can write the adapter and tests myself

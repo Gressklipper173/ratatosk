@@ -29,7 +29,7 @@ between the realms.*
 [Uninstall](#uninstall) · [Troubleshooting](#troubleshooting) · [Configuration](#configuration) ·
 [Security](#security) · [Debug](#debug) · [Panels and layout](#panels-and-layout) · [Users](#users) ·
 [Groups](#groups) · [Link tiles](#link-tiles) · [Updates](#updates) · [Schedules](#schedules) · [Integrations](#integrations) ·
-[Development](#development) · [License](#license)
+[Known limits](#known-limits) · [Development](#development) · [License](#license)
 
 ## Quick start
 
@@ -663,6 +663,15 @@ Adapters are small YAML files, and you can write your own for any service with a
 with no code. See [docs/ADAPTERS.md](docs/ADAPTERS.md) for the format and a step-by-step guide.
 Put your files in a folder and mount it into Ratatosk, for example
 `./my-adapters:/data/adapters:ro`, then restart Ratatosk.
+
+## Known limits
+
+- **One Docker host.** Ratatosk talks to the Docker socket it is given. It does not manage several
+  hosts, and Podman and Kubernetes are not supported or tested.
+- **Its own container.** It recognises itself by the hostname Docker gives the container, so a custom
+  `hostname:` or `network_mode: host` is not supported (see [Quick start](#3-adjust-it-optional)).
+- **One Pelican panel per Ratatosk.** Removing one Pelican key removes both (see [Pelican](#pelican)).
+- **Stored keys are not encrypted.** See [Security](#security).
 
 ## Development (see also [CONTRIBUTING.md](CONTRIBUTING.md))
 
