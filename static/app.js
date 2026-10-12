@@ -634,6 +634,7 @@ async function scheduleContainer(c) {
   body.replaceChildren(
     window.scheduleForm({
       container: c.name,
+      compose: !!c.project,
       updateCheck: info.update_check,
       readOnly: info.read_only,
       note: `Times are in ${info.timezone} (it is ${info.now} there now). Change the zone and see every schedule under Settings → Schedules.`,

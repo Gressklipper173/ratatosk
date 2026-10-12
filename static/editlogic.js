@@ -1,6 +1,6 @@
 // Pure helpers for the page (no DOM, no network), kept apart so Node can test them: putting a file's
 // line endings back after a raw edit, checking a group name, running a task one at a time,
-// finding a timezone by what was typed, and ordering a schedule's list of containers.
+// finding a timezone by what was typed, and the order and heading of a schedule's containers.
 // Loaded before app.js; also usable from Node (see tests/js/editlogic.test.mjs).
 
 (function (root) {
@@ -111,12 +111,16 @@
     return out;
   }
 
-  // What a schedule calls its containers in a heading: the name for one, a count for several.
-  function containerTitle(names) {
-    return names.length === 1 ? names[0] : `${names.length} containers`;
+  // The heading of a schedule: "Restart web" for one container, "Update 3 containers" for several
+  // that do the same, and just "3 containers" when their actions differ. `words` maps an action
+  // ("restart", "update", "auto") to its text.
+  function scheduleTitle(entries, words) {
+    const kinds = new Set(entries.map((e) => e.action));
+    const lead = kinds.size === 1 ? `${words[entries[0].action]} ` : "";
+    return entries.length === 1 ? `${lead}${entries[0].name}` : `${lead}${entries.length} containers`;
   }
 
-  const api = { MAX_GROUP_NAME, lineEnding, restoreEol, groupNameProblem, coalesce, updateCheckSummary, tzMatches, moveItem, containerTitle };
+  const api = { MAX_GROUP_NAME, lineEnding, restoreEol, groupNameProblem, coalesce, updateCheckSummary, tzMatches, moveItem, scheduleTitle };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.EditLogic = api;
 })(typeof window !== "undefined" ? window : globalThis);

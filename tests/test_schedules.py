@@ -177,7 +177,7 @@ def test_create_list_edit_delete(env, logged_in):
     assert r.status_code == 201
     sid = r.get_json()["id"]
     [it] = c.get("/api/schedules").get_json()["items"]
-    assert it["id"] == sid and it["containers"] == ["web"] and it["action"] == "restart" and it["freq"] == "weekly"
+    assert it["id"] == sid and it["containers"] == [{"name": "web", "action": "restart"}] and it["freq"] == "weekly"
     assert it["next_run"] and it["last_run"] == "" and it["container_exists"] is True
     # an edit may send only what changed
     assert c.put(f"/api/schedules/{sid}", json={"time": "05:15"}, headers=hdr(csrf)).status_code == 200
@@ -472,13 +472,13 @@ def test_the_loop_runs_each_tick_and_survives_an_error(env, monkeypatch):
 
 def test_a_list_keeps_its_order_and_the_older_spelling_reads_as_a_list():
     f, err = schedules.validate(base(containers=["db", "app", "web"]))
-    assert err is None and f["containers"] == ["db", "app", "web"]
+    assert err is None and [e["name"] for e in f["containers"]] == ["db", "app", "web"]
     legacy = {"container": "web", "action": "restart", "freq": "daily", "time": "03:00"}
     f, err = schedules.validate(legacy)
-    assert err is None and f["containers"] == ["web"] and "container" not in f
+    assert err is None and f["containers"] == [{"name": "web", "action": "restart"}] and "container" not in f and "action" not in f
     # a client that still sends one name changes the list to that one
-    f, err = schedules.validate({"container": "db"}, base=base(containers=["web", "app"]))
-    assert err is None and f["containers"] == ["db"]
+    f, err = schedules.validate({"container": "db", "action": "update"}, base=base(containers=["web", "app"]))
+    assert err is None and f["containers"] == [{"name": "db", "action": "update"}]
 
 
 def test_too_many_containers_are_refused(monkeypatch):
@@ -495,12 +495,12 @@ def test_a_file_from_before_lists_still_loads(env, logged_in):
     with open(env.app.SCHEDULES_PATH, "w") as f:
         json.dump({"timezone": "UTC", "items": [old]}, f)
     [it] = c.get("/api/schedules").get_json()["items"]
-    assert it["containers"] == ["web"] and "container" not in it
+    assert it["containers"] == [{"name": "web", "action": "restart"}] and "container" not in it and "action" not in it
     # the next save writes the new spelling
     assert c.put("/api/schedules/s1", json={"enabled": False}, headers=hdr(csrf)).status_code == 200
     with open(env.app.SCHEDULES_PATH) as f:
         saved = json.load(f)["items"][0]
-    assert saved["containers"] == ["web"] and "container" not in saved
+    assert saved["containers"] == [{"name": "web", "action": "restart"}] and "container" not in saved and "action" not in saved
 
 
 def test_create_and_edit_a_list(env, logged_in):
@@ -511,11 +511,12 @@ def test_create_and_edit_a_list(env, logged_in):
     assert r.status_code == 201
     sid = r.get_json()["id"]
     [it] = c.get("/api/schedules").get_json()["items"]
-    assert it["containers"] == ["db", "app"] and it["missing"] == []
+    assert [e["name"] for e in it["containers"]] == ["db", "app"] and it["missing"] == []
     # reordering and adding are edits; only the added container is looked at
-    assert c.put(f"/api/schedules/{sid}", json={"containers": ["app", "db", "web"]}, headers=hdr(csrf)).status_code == 200
-    assert c.get("/api/schedules").get_json()["items"][0]["containers"] == ["app", "db", "web"]
-    bad = c.put(f"/api/schedules/{sid}", json={"containers": ["app", "ghost"]}, headers=hdr(csrf))
+    new = [{"name": n, "action": "restart"} for n in ("app", "db", "web")]
+    assert c.put(f"/api/schedules/{sid}", json={"containers": new}, headers=hdr(csrf)).status_code == 200
+    assert c.get("/api/schedules").get_json()["items"][0]["containers"] == new
+    bad = c.put(f"/api/schedules/{sid}", json={"containers": [{"name": "app", "action": "restart"}, {"name": "ghost", "action": "restart"}]}, headers=hdr(csrf))
     assert bad.status_code == 400 and bad.get_json()["error"] == "ghost: no such container"
     # a container that has gone since does not stop other edits to the schedule
     del env.client.by_name["db"]
@@ -683,3 +684,112 @@ def test_waiting_for_an_update_job(env, monkeypatch):
     env.app._jobs["x"] = {"state": "running", "error": None}
     monkeypatch.setattr(env.app, "UPDATE_WAIT", -1)
     assert wait("x") == "timed out waiting for the update"
+
+
+# ---- one action per container -------------------------------------------------
+
+
+def mixed(*pairs):
+    return [{"name": n, "action": a} for n, a in pairs]
+
+
+def test_each_container_has_its_own_action():
+    f, err = schedules.validate(base(containers=mixed(("db", "auto"), ("app", "update"), ("web", "restart"))))
+    assert err is None and [e["action"] for e in f["containers"]] == ["auto", "update", "restart"]
+    plain = {"freq": "daily", "time": "03:00"}  # no schedule-wide action to fall back on
+    for bad in (mixed(("db", "stop")), [{"name": "db"}], ["db"], [{"action": "restart"}], mixed(("db", "restart"), ("db", "update"))):
+        assert schedules.validate({**plain, "containers": bad})[0] is None, bad
+    # a bare name keeps the action it has in the stored schedule
+    stored = base(containers=mixed(("db", "auto"), ("web", "restart")))
+    f, err = schedules.validate({"containers": ["web", "db"]}, base=stored)
+    assert err is None and f["containers"] == mixed(("web", "restart"), ("db", "auto"))
+    # an action sent alone sets every container's
+    f, err = schedules.validate({"action": "update"}, base=stored)
+    assert err is None and f["containers"] == mixed(("db", "update"), ("web", "update"))
+
+
+def test_only_restart_is_possible_without_compose(env, logged_in):
+    c, csrf = logged_in
+    env.client.add(FakeContainer("plain"))
+    env.client.add(FakeContainer("comp", labels=COMPOSE))
+    for action in ("update", "auto"):
+        r = create(c, csrf, containers=mixed(("comp", "restart"), ("plain", action)))
+        assert r.status_code == 400 and r.get_json()["error"] == "plain: only Docker Compose containers can be updated"
+    assert create(c, csrf, containers=mixed(("plain", "restart"), ("comp", "auto"))).status_code == 201
+
+
+def test_update_actions_need_updates_to_be_switched_on(env, logged_in, monkeypatch):
+    c, csrf = logged_in
+    env.client.add(FakeContainer("comp", labels=COMPOSE))
+    monkeypatch.setattr(env.app, "UPDATE_CHECK", False)
+    assert create(c, csrf, containers=mixed(("comp", "restart"))).status_code == 201
+    for action in ("update", "auto"):
+        assert "switched off" in create(c, csrf, containers=mixed(("comp", action))).get_json()["error"]
+
+
+def test_auto_updates_when_there_is_something_newer(env, monkeypatch):
+    add_web(env)
+    seed(env, containers=mixed(("web", "auto")))
+    calls = fake_compose(env, monkeypatch)
+    run_threads_inline(env, monkeypatch)
+    env.app.run_due_schedules(SLOT + 5)
+    assert [c[-2:] for c in calls] == [["pull", "web"], ["--no-deps", "web"]]
+    assert env.client.by_name["web"].calls == []  # the update recreates it; no extra restart
+    assert stored(env)["last_result"] == "update started"
+
+
+def test_auto_restarts_when_there_is_nothing_newer(env, monkeypatch):
+    add_web(env, latest="sha256:old")
+    seed(env, containers=mixed(("web", "auto")))
+    calls = fake_compose(env, monkeypatch)
+    env.app.run_due_schedules(SLOT + 5)
+    assert calls == [] and env.client.by_name["web"].calls == ["restart"]
+    assert stored(env)["last_result"] == "no update, restarted"
+    assert any("scheduled update/restart of web: no update, restarted" in e["msg"] for e in env.app.activity.snapshot()[0])
+
+
+def test_auto_does_not_hide_an_update_that_cannot_run(env, monkeypatch):
+    add_web(env)
+    seed(env, containers=mixed(("web", "auto")))
+    monkeypatch.setattr(env.app.shutil, "which", lambda n: "/usr/bin/docker")  # but the compose file is not visible
+    env.app.run_due_schedules(SLOT + 5)
+    result = stored(env)["last_result"]
+    assert result.startswith("skipped: compose file not visible") and env.client.by_name["web"].calls == []
+
+
+def test_update_only_leaves_a_container_alone_when_nothing_is_newer(env, monkeypatch):
+    add_web(env, latest="sha256:old")
+    seed(env, containers=mixed(("web", "update")))
+    env.app.run_due_schedules(SLOT + 5)
+    assert env.client.by_name["web"].calls == [] and stored(env)["last_result"] == "skipped: no update available"
+
+
+def test_auto_on_a_container_that_is_no_longer_compose_just_restarts(env):
+    web = env.client.add(FakeContainer("web"))  # stored as auto, but it has lost its compose labels
+    seed(env, containers=mixed(("web", "auto")))
+    env.app.run_due_schedules(SLOT + 5)
+    assert web.calls == ["restart"] and stored(env)["last_result"] == "no update, restarted"
+
+
+def test_a_mixed_list_does_each_containers_own_action(env, monkeypatch):
+    add_two(env)  # web and db, both with a newer image
+    plain = env.client.add(FakeContainer("plain"))
+    env.client.add(FakeContainer("quiet", labels={**COMPOSE, "com.docker.compose.service": "quiet"}, image_ref="q:1", repo_digests=["q@sha256:same"]))
+    env.client.registry["q:1"] = "sha256:same"
+    seed(env, containers=mixed(("db", "update"), ("plain", "restart"), ("quiet", "auto"), ("web", "update")))
+    calls = fake_compose(env, monkeypatch)
+    run_threads_inline(env, monkeypatch)
+    env.app.run_due_schedules(SLOT + 5)
+    assert [c[-1] for c in calls] == ["db", "db", "web", "web"]
+    assert plain.calls == ["restart"] and env.client.by_name["quiet"].calls == ["restart"]
+    assert stored(env)["last_result"] == "4 done"
+    assert any("scheduled actions" not in e["msg"] for e in env.app.activity.snapshot()[0])
+
+
+def test_a_restart_only_list_never_asks_the_registry(env, monkeypatch):
+    boxes, order = add_many(env, "db", "app")
+    seed(env, containers=mixed(("db", "restart"), ("app", "restart")))
+    monkeypatch.setattr(env.app, "check_registry", lambda: pytest.fail("restarts do not need the registry"))
+    run_threads_inline(env, monkeypatch)
+    env.app.run_due_schedules(SLOT + 5)
+    assert order == ["db", "app"]

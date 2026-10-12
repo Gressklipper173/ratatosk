@@ -407,14 +407,20 @@ dialog.cfg::backdrop { background: rgba(0, 0, 0, 0.45); }
 .sched-picks .int-note { margin: 0; }
 .sched-checks { margin: 0; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; max-height: 14rem; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .sched-checks legend { padding: 0 4px; color: var(--muted); font-size: 0.8rem; }
-.sched-check { display: flex; align-items: center; gap: 8px; min-height: 32px; overflow-wrap: anywhere; cursor: pointer; }
-.sched-check input { width: 18px; height: 18px; flex: none; accent-color: var(--accent); }
+/* one row per container: three boxes (update/restart, update, restart), then its name */
+.sched-pickrow { display: grid; grid-template-columns: repeat(3, 4.6rem) minmax(0, 1fr); align-items: center; column-gap: 4px; min-height: 32px; }
+.sched-pickhead { position: sticky; top: 0; z-index: 1; background: var(--panel); color: var(--muted); font-size: 0.75rem; line-height: 1.15; align-items: end; padding-bottom: 2px; }
+.sched-col { text-align: center; }
+.sched-pickrow input { justify-self: center; width: 18px; height: 18px; accent-color: var(--accent); }
+.sched-pickrow input:disabled { opacity: 0.35; }
+.sched-pickrow .sched-name { overflow-wrap: anywhere; padding-left: 6px; }
 .sched-order { display: flex; flex-direction: column; gap: 4px; }
 /* a fixed height, so the dialog keeps its size however many are ticked; more than fit scroll */
 .sched-chosen { list-style: decimal inside; margin: 0; padding: 4px 8px; box-sizing: border-box; height: 9.5rem; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; display: flex; flex-direction: column; gap: 4px; }
 .sched-chosen li { display: flex; align-items: center; gap: 6px; min-height: 32px; flex: none; }
 .sched-chosen .sched-placeholder { list-style: none; color: var(--muted); }
 .sched-chosen .sched-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.sched-chosen .sched-name small { margin-left: 8px; color: var(--muted); font-size: 0.8rem; }
 .sched-form select, .sched-form input[type="time"], .sched-tzbox input { font: inherit; min-height: 36px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); padding: 0 8px; min-width: 0; max-width: 100%; }
 .sched-form [hidden], .sched-form .int-note[hidden] { display: none; }
 /* the timezone search: the matches sit in the page flow under the box, so the dialog can't clip them */

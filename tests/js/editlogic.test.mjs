@@ -235,8 +235,17 @@ test("moveItem stops at the ends and ignores a bad index", () => {
   assert.notEqual(E.moveItem(list, 0, -1), list); // always a copy
 });
 
-test("containerTitle names one container and counts several", () => {
-  assert.equal(E.containerTitle(["db"]), "db");
-  assert.equal(E.containerTitle(["db", "app"]), "2 containers");
-  assert.equal(E.containerTitle(["a", "b", "c", "d", "e"]), "5 containers");
+const WORDS = { restart: "Restart", update: "Update", auto: "Update/restart" };
+const entry = (name, action) => ({ name, action });
+
+test("scheduleTitle names one container, counts several, and leads with a shared action", () => {
+  assert.equal(E.scheduleTitle([entry("db", "restart")], WORDS), "Restart db");
+  assert.equal(E.scheduleTitle([entry("db", "auto")], WORDS), "Update/restart db");
+  assert.equal(E.scheduleTitle([entry("db", "update"), entry("app", "update")], WORDS), "Update 2 containers");
+  assert.equal(E.scheduleTitle([entry("a", "restart"), entry("b", "restart"), entry("c", "restart")], WORDS), "Restart 3 containers");
+});
+
+test("scheduleTitle drops the action when the containers differ", () => {
+  assert.equal(E.scheduleTitle([entry("db", "update"), entry("app", "restart")], WORDS), "2 containers");
+  assert.equal(E.scheduleTitle([entry("a", "auto"), entry("b", "update"), entry("c", "restart")], WORDS), "3 containers");
 });

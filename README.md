@@ -530,32 +530,40 @@ Things that trip people up:
 ## Schedules
 
 Admins can have Ratatosk restart or update containers by itself. Press **Schedule…** in a
-container's **⋯** menu for that one container, or open **Settings → Schedules**, which lists every
-schedule with its next and last run and lets you switch one off or delete it. There, **Update
-containers regularly** opens a dialog where you tick the containers to keep up to date, and the form
-under the list builds any schedule (restart or update) for **several containers at once**. A schedule is one or more containers, an action (**Restart** or
-**Update**), a time, and how often: every day, every week on a weekday you pick, or every month on a
-day you pick. Day 29 to 31 means the last day of a shorter month.
+container's **⋯** menu for one container, or open **Settings → Schedules**, which lists every
+schedule with its next and last run and lets you switch one off or delete it. There,
+**Schedule update/restart** opens a dialog for **several containers at once**: every container has a row
+with three boxes, and you tick the one you want for it.
 
-- **Several containers.** Tick the containers in the list. They run one after another in the order
-  they were ticked, shown under the list as "Runs in this order", where the ↑ and ↓ buttons change it.
-  Put a database before the apps that use it. The **Update containers regularly** dialog offers only
-  Docker Compose containers, since only those can be updated. An update waits until the container before it has been updated; a
-  container that cannot be done (no update, not a Compose container, gone, failed) is noted and the
-  rest still run. The list shows the outcome in one line, for example
-  `2 done, 1 failed (web: no such container)`, once the whole list has finished, and the **Debug**
-  panel has a line for each container. A schedule holds up to 50 containers, and all of them take the
-  same action and time; make a second schedule for a different action or time.
+| Box | What happens when the schedule runs |
+|-----|--------------------------------------|
+| **Update/restart** | Updates the container if a newer image exists (the update recreates it, which restarts it), and restarts it if not |
+| **Update** | Updates the container only if a newer image exists; otherwise leaves it alone |
+| **Restart** | Restarts the container, nothing more |
+
+At most one box is ticked per row (ticking another moves it), and a container with none is not part of
+the schedule. A container that isn't started by Docker Compose can only be restarted, and updates need
+`UPDATE_CHECK` on. A schedule is its containers with their actions, a time, and how often: every day,
+every week on a weekday you pick, or every month on a day you pick. Day 29 to 31 means the last day
+of a shorter month.
+
+- **Order.** The ticked containers are listed under the rows as "Runs in this order", in the order
+  you ticked them, and the ↑ and ↓ buttons change it. They run one after another, so put a database
+  before the apps that use it. An update waits until the container before it has been updated. One
+  that can't be done (no update, gone, failed) is noted and the rest still run. The list shows the
+  outcome in one line, for example `2 done, 1 failed (web: no such container)`, once the whole list has
+  finished, and the **Debug** panel has a line for each container. A schedule holds up to 50
+  containers, and they share one time; make another schedule for a different time.
 
 - **Timezone.** The time is in the one timezone chosen at the top of the Schedules list (UTC until you
   pick). Click the box and type part of a city ("hel" finds Europe/Helsinki), then pick a match with the
   arrow keys and Enter, or with the mouse. It applies to every schedule and is saved with them, so changing it moves them all. A time that
   a clock change skips runs once, an hour later; one it repeats runs the first time.
-- **Update** does what the Update button does: it first asks the registry again, then pulls and
-  recreates each container only if a newer image exists. If there is none, or the update cannot run (see
-  [Making the Update button work](#making-the-update-button-work)) or one is already running, the run
-  is skipped and the list says why. Only Docker Compose containers can be scheduled for update, and
-  not when `UPDATE_CHECK=false`.
+- **Updating** does what the Update button does: the schedule first asks the registry again, then pulls
+  and recreates each container that has a newer image. If an update cannot run (see
+  [Making the Update button work](#making-the-update-button-work)) or one is already running, that
+  container is skipped and the list says why. This includes **Update/restart**: it does not fall back to
+  a restart then, so a broken update path stays visible.
 - **Restart** works like the Restart button, including a Pelican game server going through its panel.
 - **Missed runs are not made up.** If Ratatosk was stopped, or the host asleep, more than 5 minutes
   past the time, that run is skipped and noted as missed. The next one happens as normal. Editing a

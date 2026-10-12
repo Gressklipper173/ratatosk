@@ -1255,6 +1255,9 @@ def container_update(name):
     return jsonify({"error": error}), code
 
 
+NO_UPDATE = "no update available"
+
+
 def start_update(name):
     """Begin updating one Compose container in the background. Returns (error, http status):
     (None, 202) when it started. Shared by the Update button and the scheduler, which do their
@@ -1271,7 +1274,7 @@ def start_update(name):
         return "Ratatosk can't update its own container", 400
     d = describe(c)
     if not d["update"]:
-        return "no update available", 400
+        return NO_UPDATE, 400
     if d["update"]["blocked"]:
         return d["update"]["blocked"], 400
     labels = c.attrs.get("Config", {}).get("Labels") or {}
@@ -1914,25 +1917,40 @@ def _summary(results):
     return text[:schedules.MAX_RESULT]
 
 
+ACTION_WORDS = {"restart": "restart", "update": "update", "auto": "update/restart"}
+
+
+def _schedule_word(item):
+    """What a log line calls the schedule's action: the shared one, or 'actions' when they differ."""
+    kinds = {e["action"] for e in item["containers"]}
+    return ACTION_WORDS[kinds.pop()] if len(kinds) == 1 else "actions"
+
+
 def _run_schedule(item):
-    """Do one scheduled action on each of its containers, one after another in the stored order,
-    and return a short result for the list. One that can't be done is noted and the rest go on."""
-    names = item["containers"]
+    """Do each container's action, one after another in the stored order, and return a short
+    result for the list. One that can't be done is noted and the rest go on."""
+    entries = item["containers"]
     if READ_ONLY:
-        activity.log("warn", "schedules", f"scheduled {item['action']} of {', '.join(names)} skipped: Ratatosk is in read-only mode")
+        names = ", ".join(e["name"] for e in entries)
+        activity.log("warn", "schedules", f"scheduled {_schedule_word(item)} of {names} skipped: Ratatosk is in read-only mode")
         return "skipped: read-only mode"
-    if item["action"] == "update":
+    if any(e["action"] != "restart" for e in entries):
         # an update needs the registry's newest answer, which may be up to half an hour old
         check_registry()
     results = []
-    for i, name in enumerate(names):
-        label = f"scheduled {item['action']} of {name}"
-        if item["action"] == "restart":
+    for i, e in enumerate(entries):
+        name, action = e["name"], e["action"]
+        label = f"scheduled {ACTION_WORDS[action]} of {name}"
+        if action == "restart":
             err, code = run_container_action(name, "restart")
             text = _schedule_outcome(label, err, code, "restarted")
         else:
             err, code = start_update(name)
-            if err is None and i < len(names) - 1:
+            if action == "auto" and err == NO_UPDATE:
+                # nothing newer to pull, so the container is only restarted
+                err, code = run_container_action(name, "restart")
+                text = _schedule_outcome(label, err, code, "no update, restarted")
+            elif err is None and i < len(entries) - 1:
                 # the next one waits, so a database others rely on is back before they are touched
                 text = _schedule_outcome(label, _wait_for_update(name), 500, "updated")
             else:
@@ -1945,7 +1963,7 @@ def _finish_due(item, slot, now, tz):
     """Run one due schedule (or note that it was missed) and store how it went."""
     if now - slot > SCHEDULE_GRACE:
         result = f"missed: not running at {schedules.fmt(slot, tz)}"
-        activity.log("warn", "schedules", f"scheduled {item['action']} of {', '.join(item['containers'])} {result}")
+        activity.log("warn", "schedules", f"scheduled {_schedule_word(item)} of {', '.join(e['name'] for e in item['containers'])} {result}")
         ran = False
     else:
         result, ran = _run_schedule(item), True
@@ -1998,8 +2016,8 @@ def _scheduler():
 
 def _schedule_view(item, tz, now, names):
     nxt = schedules.next_slot(item, tz, now) if item["enabled"] else None
-    shown = {k: item[k] for k in ("id", "containers", "action", "freq", "time", "weekday", "monthday", "enabled", "last_result")}
-    missing = [] if names is None else [n for n in item["containers"] if n not in names]
+    shown = {k: item[k] for k in ("id", "containers", "freq", "time", "weekday", "monthday", "enabled", "last_result")}
+    missing = [] if names is None else [e["name"] for e in item["containers"] if e["name"] not in names]
     return {
         **shown,
         "next_run": schedules.fmt(nxt, tz),
@@ -2019,7 +2037,7 @@ def _container_error(name, action):
         return str(e)
     if is_self(c):
         return "Ratatosk can't control its own container"
-    if action == "update":
+    if action in ("update", "auto"):
         if not UPDATE_CHECK:
             return "updates are switched off"
         if compose_info(c.attrs.get("Config", {}).get("Labels") or {}) is None:
@@ -2027,13 +2045,13 @@ def _container_error(name, action):
     return None
 
 
-def _schedule_target_error(fields, names=None):
-    """Why a container of this schedule can't take its action, or None. `names` narrows the
-    check to some of the containers (the ones an edit added)."""
-    for name in fields["containers"] if names is None else names:
-        err = _container_error(name, fields["action"])
+def _schedule_target_error(fields, entries=None):
+    """Why a container of this schedule can't take its action, or None. `entries` narrows the
+    check to some of the containers (the ones an edit added or changed)."""
+    for e in fields["containers"] if entries is None else entries:
+        err = _container_error(e["name"], e["action"])
         if err:
-            return f"{name}: {err}" if len(fields["containers"]) > 1 else err
+            return f"{e['name']}: {err}" if len(fields["containers"]) > 1 else err
     return None
 
 
@@ -2101,10 +2119,10 @@ def api_schedule(sid):
             return jsonify({"error": None})
         fields, err = schedules.validate(body, base=item)
         if not err:
-            # a new action means every container is checked again; otherwise only the ones added
-            added = None if fields["action"] != item["action"] else [n for n in fields["containers"] if n not in item["containers"]]
-            if added is None or added:
-                err = _schedule_target_error(fields, added)
+            # only the containers added or given another action are looked at
+            changed = [e for e in fields["containers"] if e not in item["containers"]]
+            if changed:
+                err = _schedule_target_error(fields, changed)
         if err:
             return jsonify({"error": err}), 400
         item.update(fields)
