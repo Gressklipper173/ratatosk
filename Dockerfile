@@ -16,7 +16,7 @@ COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 
 COPY VERSION ./
-COPY app.py activity.py editor.py integrations.py handlers.py schedules.py ./
+COPY app.py activity.py editor.py integrations.py handlers.py schedules.py pinned.py ./
 COPY adapters/ adapters/
 COPY templates/ templates/
 COPY static/ static/

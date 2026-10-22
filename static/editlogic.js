@@ -75,6 +75,28 @@
     return text;
   }
 
+  // The image reference with its tag replaced: "ghcr.io/o/app:v1.86.0" + "v1.87.0" gives
+  // "ghcr.io/o/app:v1.87.0". A port in the registry host ("host:5000/app") is not a tag, and a
+  // digest ("@sha256:...") is dropped.
+  function retagImage(ref, tag) {
+    const bare = String(ref).split("@")[0];
+    const colon = bare.lastIndexOf(":");
+    const base = colon > bare.lastIndexOf("/") ? bare.slice(0, colon) : bare;
+    return `${base}:${tag}`;
+  }
+
+  // The words of the "newer version" dialog for a container's `pinned` object, as
+  // {intro, newLine, ignoreHint, canRetag, latest}. `ref` is the container's image reference.
+  function pinnedDialogText(name, pinned, ref) {
+    return {
+      intro: `${name} is pinned to ${pinned.current}, so the normal update check can't see new releases. ${pinned.newer} is available.`,
+      newLine: `image: ${retagImage(ref, pinned.newer)}`,
+      ignoreHint: `Hides this until a version newer than ${pinned.newer} appears. Undo it in Settings → Updates.`,
+      canRetag: !pinned.reason,
+      latest: !!pinned.latest,
+    };
+  }
+
   // The names in `all` (timezones like "Europe/Helsinki") that match what was typed, best first, at
   // most `limit`. Case, spaces and underscores don't matter ("new york" finds America/New_York), and
   // the city counts before the region, so "hel" puts Helsinki ahead of names that merely contain it.
@@ -120,7 +142,7 @@
     return entries.length === 1 ? `${lead}${entries[0].name}` : `${lead}${entries.length} containers`;
   }
 
-  const api = { MAX_GROUP_NAME, lineEnding, restoreEol, groupNameProblem, coalesce, updateCheckSummary, tzMatches, moveItem, scheduleTitle };
+  const api = { MAX_GROUP_NAME, lineEnding, restoreEol, groupNameProblem, coalesce, updateCheckSummary, retagImage, pinnedDialogText, tzMatches, moveItem, scheduleTitle };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.EditLogic = api;
 })(typeof window !== "undefined" ? window : globalThis);

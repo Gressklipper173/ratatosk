@@ -249,3 +249,31 @@ test("scheduleTitle drops the action when the containers differ", () => {
   assert.equal(E.scheduleTitle([entry("db", "update"), entry("app", "restart")], WORDS), "2 containers");
   assert.equal(E.scheduleTitle([entry("a", "auto"), entry("b", "update"), entry("c", "restart")], WORDS), "3 containers");
 });
+
+// ---- retagImage and pinnedDialogText (the newer-version dialog for a pinned image)
+
+test("retagImage swaps the tag and keeps the registry and path", () => {
+  assert.equal(E.retagImage("ghcr.io/o/app:v1.86.0", "v1.87.0"), "ghcr.io/o/app:v1.87.0");
+  assert.equal(E.retagImage("nginx:1.25", "1.26"), "nginx:1.26");
+});
+
+test("retagImage does not take a registry port for a tag, and drops a digest", () => {
+  assert.equal(E.retagImage("host:5000/app", "v2"), "host:5000/app:v2");
+  assert.equal(E.retagImage("host:5000/app:v1", "v2"), "host:5000/app:v2");
+  assert.equal(E.retagImage("o/app:v1@sha256:abc", "v2"), "o/app:v2");
+});
+
+test("pinnedDialogText names the versions and the line to use", () => {
+  const t = E.pinnedDialogText("web", { current: "v1.86.0", newer: "v1.87.0", latest: true, reason: null }, "o/app:v1.86.0");
+  assert.match(t.intro, /^web is pinned to v1\.86\.0, .*v1\.87\.0 is available\.$/);
+  assert.equal(t.newLine, "image: o/app:v1.87.0");
+  assert.match(t.ignoreHint, /newer than v1\.87\.0 appears/);
+  assert.equal(t.canRetag, true);
+  assert.equal(t.latest, true);
+});
+
+test("pinnedDialogText turns the compose rewrite off when there is a reason", () => {
+  const t = E.pinnedDialogText("web", { current: "v1", newer: "v2", latest: false, reason: "mounted read-only" }, "o/app:v1");
+  assert.equal(t.canRetag, false);
+  assert.equal(t.latest, false);
+});

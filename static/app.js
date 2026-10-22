@@ -667,6 +667,76 @@ async function updateContainer(c, btn) {
   refresh();
 }
 
+// A container pinned to a version tag has no digest update, so the normal check never notices a
+// new release. This dialog offers the ways to move on; the server does the compose rewrite and
+// checks everything again (admin, a newer version still exists, the file can be written).
+function pinnedDialog(c) {
+  if (editing) return;
+  const pinned = c.pinned;
+  const name = displayName(c);
+  const text = EditLogic.pinnedDialogText(name, pinned, c.image);
+  const dlg = el("dialog", "cfg narrow");
+  const title = el("h2", null, `Newer version of ${name}`);
+  title.id = "pinned-title";
+  dlg.setAttribute("aria-labelledby", title.id);
+  const body = el("div", "cfg-body");
+  const foot = el("div", "cfg-foot");
+  const head = el("div", "cfg-head");
+  head.append(title);
+  dlg.append(head, body);
+
+  let picked = text.canRetag ? "newer" : "manual";
+  const opts = [["newer", `Update the compose file to ${pinned.newer} and update now`, text.canRetag ? "" : pinned.reason]];
+  if (text.latest) {
+    opts.push(["latest", "Update the compose file to latest and update now",
+      text.canRetag ? "latest can jump several versions at once, past changes that need a migration step." : pinned.reason]);
+  }
+  opts.push(["manual", "I'll change it myself", ""], ["ignore", "Ignore", text.ignoreHint]);
+
+  const line = el("code", null, text.newLine);
+  const lineBox = el("p", "hint", "Use this line in your compose file: ");
+  lineBox.append(line);
+  const list = opts.map(([value, head, sub]) => {
+    const label = el("label", "del-choice");
+    const radio = el("input");
+    radio.type = "radio";
+    radio.name = "pinned-choice";
+    radio.value = value;
+    radio.checked = picked === value;
+    radio.disabled = !text.canRetag && (value === "newer" || value === "latest");
+    radio.addEventListener("change", () => {
+      picked = value;
+      lineBox.hidden = value !== "manual";
+    });
+    label.append(radio, el("span", null, head));
+    if (sub) label.append(el("small", null, sub));
+    return label;
+  });
+  lineBox.hidden = picked !== "manual";
+
+  const apply = miniButton("Apply", "primary", async () => {
+    if (picked === "manual") { dlg.close(); return; }
+    apply.disabled = true;
+    setError("action", "");
+    try {
+      const res = await api(`/api/containers/${encodeURIComponent(c.name)}/tag`, {
+        method: "POST",
+        body: JSON.stringify({ action: picked, version: pinned.newer }),
+      });
+      if (res.error) setError("action", `update ${c.name}: ${res.error}`);
+    } catch (e) {
+      setError("action", `update ${c.name}: ${e}`);
+    }
+    dlg.close();
+    refresh();
+  });
+  foot.append(apply, miniButton("Cancel", "", () => dlg.close()));
+  body.append(el("p", null, text.intro), ...list, lineBox, foot);
+  dlg.addEventListener("close", () => dlg.remove());
+  document.body.append(dlg);
+  dlg.showModal();
+}
+
 function logLine(line) {
   const d = el("div");
   const i = line.indexOf(" ");
@@ -879,7 +949,7 @@ function makeItem(name) {
       // "stopping", not just "running"
       const wings = c.game?.state;
       if (wings) s = { offline: "exited", starting: "restarting", stopping: "restarting" }[wings] || s;
-      const upd = c.update;
+      const upd = c.update || (c.pinned?.state ? c.pinned : null); // a pinned image's retag shows the same way
       dot.className = "dot " + s;
       stateEl.title = "";
       if (upd?.state === "running") {
@@ -890,7 +960,9 @@ function makeItem(name) {
         stateEl.title = upd.error || "";
       }
       stateEl.textContent = wings && s !== "update failed" && s !== "updating" ? wings : s;
-      updTag.hidden = !(upd && upd.state !== "running" && !c.self);
+      const pin = c.pinned && !c.update && c.pinned.state !== "running" && !c.self ? c.pinned : null;
+      updTag.textContent = pin ? "new version" : "update available";
+      updTag.hidden = !(pin || (c.update && c.update.state !== "running" && !c.self));
       kebab.setAttribute("aria-label", "Actions for " + shownName);
       // "Group (Wanted)" shows what following the group means right now
       prioBox.select.options[0].textContent = `Group (${PRIORITY_TEXT[groupPriority(groupOf(c))]})`;
@@ -904,9 +976,12 @@ function makeItem(name) {
       // focus isn't lost to every poll
       const running = wings ? wings !== "offline" : c.status === "running";
       const canDelete = role === "admin" && !c.game && !c.self && ["exited", "created", "dead"].includes(c.status);
-      const canUpdate = role === "admin" && upd && upd.state !== "running" && !c.self; // updating is an admin action
+      const canUpdate = role === "admin" && c.update && c.update.state !== "running" && !c.self; // updating is an admin action
+      const canRetag = role === "admin" && !!pin;
       const canSchedule = role === "admin" && !c.self;
-      const key = [running, c.self, readOnly, upd?.state, upd?.blocked, canDelete, canUpdate, canSchedule].join("|");
+      const p = c.pinned;
+      const key = [running, c.self, readOnly, upd?.state, upd?.blocked, canDelete, canUpdate, canSchedule,
+        canRetag, c.image, p?.current, p?.newer, p?.latest, p?.reason, p?.state, p?.error].join("|");
       if (key === actionKey) return;
       actionKey = key;
       actionBtns.replaceChildren();
@@ -922,6 +997,13 @@ function makeItem(name) {
           b.title = "A newer image is available";
           b.addEventListener("click", () => updateContainer(c, b));
         }
+        updateSlot.append(b);
+      }
+      if (canRetag) {
+        const b = el("button", "act update pinned", "Update");
+        b.type = "button";
+        b.title = `Pinned to ${pin.current}; ${pin.newer} is available`;
+        b.addEventListener("click", () => pinnedDialog(c));
         updateSlot.append(b);
       }
       for (const a of running ? ["restart", "stop"] : ["start"]) {
@@ -1566,6 +1648,7 @@ async function loadList() {
     readOnly = list.read_only;
     role = list.role;
     applyRole();
+    renderIgnoredUpdates(list.ignored_updates || []);
     loaded = true;
     // the server's copy may predate a save that is running or just finished, so it must not replace newer local edits
     if (!dragging && localEdits === editsAtStart && savesDone === savesAtStart && !saveGroups.busy()) groupSettings = list.groups;
@@ -2238,6 +2321,33 @@ if (checkUpdatesBtn) {
     }
     refresh(); // paint the new badges now
   });
+}
+
+// Version notices the admin chose to ignore (Settings → Updates), each undoable here. The elements
+// are only in the page for an admin with update checks on.
+const ignoredBox = document.getElementById("ignored-updates");
+const noIgnored = document.getElementById("no-ignored-updates");
+function renderIgnoredUpdates(ignored) {
+  if (!ignoredBox) return;
+  noIgnored.hidden = ignored.length > 0;
+  const key = JSON.stringify(ignored.map((i) => [i.name, i.version]));
+  if (ignoredBox.dataset.key === key) return;
+  ignoredBox.dataset.key = key;
+  ignoredBox.replaceChildren(...ignored.map((i) => {
+    const row = el("p", "int-dismissed", `${i.name} \u2014 ignored ${i.version} `);
+    row.append(miniButton("Un-ignore", "", async (b) => {
+      b.disabled = true;
+      setError("action", "");
+      try {
+        const res = await api(`/api/updates/ignored/${encodeURIComponent(i.name)}/restore`, { method: "POST" });
+        if (res.error) setError("action", `un-ignore ${i.name}: ${res.error}`);
+      } catch (e) {
+        setError("action", `un-ignore ${i.name}: ${e}`);
+      }
+      refresh();
+    }));
+    return row;
+  }));
 }
 
 toggleAllBtn.addEventListener("click", () => {

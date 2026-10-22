@@ -249,6 +249,7 @@ button.logout { font: inherit; padding: 0; min-height: 44px; border: 0; backgrou
 button.act { font: inherit; min-height: 40px; padding: 0 16px; border-radius: 6px; cursor: pointer; border: 1px solid var(--line); background: var(--panel); color: var(--text); }
 button.act:hover:not(:disabled) { border-color: var(--accent); }
 button.act.update { border-color: var(--accent); }
+button.act.update.pinned { border-color: var(--warn); color: var(--warn); }
 button.act:disabled { opacity: 0.5; cursor: default; }
 button.start { color: var(--ok); border-color: var(--ok); }
 button.stop { color: var(--bad); border-color: var(--bad); }
@@ -351,6 +352,7 @@ dialog.cfg::backdrop { background: rgba(0, 0, 0, 0.45); }
 .cfg-path { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--muted); }
 .cfg-form { display: grid; gap: 8px; }
 .cfg-section { margin: 8px 0 0; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.cfg-sub { margin: 4px 0 0; font-size: 0.85rem; font-weight: 600; }
 .cfg-field { display: grid; grid-template-columns: minmax(0, 14rem) minmax(0, 1fr); gap: 8px; align-items: center; }
 .cfg-field > span { overflow-wrap: anywhere; }
 .cfg-field input:not([type="checkbox"]), .cfg-listrow input { font: inherit; min-height: 36px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); padding: 0 8px; min-width: 0; width: 100%; }

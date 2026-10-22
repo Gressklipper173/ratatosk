@@ -17,6 +17,7 @@ between the realms.*
 - Link tiles: a "go to" tile for every running container that publishes a port
 - The browser tab shows the overall status: a green, amber or red dot and the count (for example "11/12 · Ratatosk")
 - Update badges and an Update button for Docker Compose containers
+- A yellow update notice for images pinned to a version, with a choice of how to move on
 - Schedules: restart or update a container at a set time every day, week or month (admins)
 - Optional panels for apps it knows (see [Integrations](#integrations)), and a YAML format for your own
 - A **Debug** button that shows what Ratatosk itself is doing (app requests,
@@ -74,7 +75,8 @@ Open `docker-compose.yml`. The defaults work as they are. The usual changes are:
   [Storage meters](#storage-meters) explain them. You can add them later. For the Update button each
   Compose project's folder must be mounted at the **same path as on the host**
   (`/home/me/media:/home/me/media:ro`); the storage-meter mount is a different thing and does not
-  count. See [Making the Update button work](#making-the-update-button-work).
+  count. Drop the `:ro` if you also want Ratatosk to be able to change a pinned image version in
+  that project's compose file. See [Making the Update button work](#making-the-update-button-work).
 
 Don't set `hostname:` or `network_mode: host` on the service. Ratatosk finds its own container by
 the hostname Docker gives it, and needs that to avoid offering to stop itself.
@@ -174,6 +176,8 @@ docker compose up -d
 ```
 
 The archive holds password hashes and any app keys you stored, and they are **not encrypted**. Keep it private.
+It also holds your ignored version notices (`ignored_updates.json`). The compose files Ratatosk edits
+when you pick a newer version belong to your own projects and are not in this volume.
 
 ## Uninstall
 
@@ -213,6 +217,17 @@ Then remove the folder if you like.
   `/home:/host/home` does not count: [Making the Update button work](#making-the-update-button-work).
   If the tooltip says "this image has no docker CLI", the image was built without it; build from this
   repository's Dockerfile.
+- **I pinned a version and see no update.** A pinned tag such as `v1.86.0` never shows the normal
+  update; Ratatosk looks for a newer version tag instead (yellow **Update** button). It only does
+  that for a tag shaped like a version with a later one of the same shape, for images on a registry
+  that answers without a login, and not while you have ignored that version (**Settings → Updates →
+  Ignored version notices**). `UPDATE_CHECK=false` turns it off. See
+  [Pinned version tags](#pinned-version-tags).
+- **In the yellow Update dialog the first two choices are greyed out.** Ratatosk can't edit the
+  compose file. The reason is shown in the dialog: the project folder is not mounted at the same
+  path as on the host, it is mounted with `:ro`, the image comes from a variable such as `${TAG}`,
+  or no single plain `image:` line was found for that service. Mount the folder without `:ro` (see
+  [Making the Update button work](#making-the-update-button-work)) or choose **Change it yourself**.
 - **An app's panel says it could not reach the app, or shows nothing.** See [Integrations](#integrations);
   the **Debug** button in the page header shows each request and why it failed.
 
@@ -240,6 +255,7 @@ port. Everything it stores is in `DATA_DIR`:
 | `integrations.json` | App keys and logins you entered (mode 0600, not encrypted; Ratatosk runs as root, so the mode does not keep other root processes or anyone with Docker access out) |
 | `groups/` | One file per user: layout, groups, names, priorities, storage meters |
 | `schedules.json` | Scheduled restarts and updates, and the timezone they use |
+| `ignored_updates.json` | Version notices you chose to ignore, by container name |
 | `secret_key` | Signs the session cookies |
 | `adapters/` | Your own app adapters, if you mount some |
 
@@ -251,9 +267,14 @@ port. Everything it stores is in `DATA_DIR`:
 - The example compose file publishes the port on `127.0.0.1` only. Opening it to other devices
   is your choice; Docker's published ports bypass the host firewall.
 - Set `READ_ONLY=true` to disable the actions that change containers, app keys, game-server config
-  files and users. Saving your layout, dismissing and restoring app notices, the Debug detail level
-  and changing your own password stay allowed, because they change only what is displayed or your
-  own account.
+  files and users. Saving your layout, dismissing and restoring app notices, ignoring and
+  un-ignoring pinned-version notices, the Debug detail level and changing your own password stay
+  allowed, because they change only what is displayed or your own account.
+- If you mount a Compose project's folder without `:ro`, Ratatosk can rewrite its compose file: an
+  admin's choice in the yellow Update dialog changes the one `image:` line of one service
+  ([Pinned version tags](#pinned-version-tags)). Mount it `:ro` if you don't want that; the Update
+  button still works. The tag lookup behind that notice is a direct HTTPS request from the Ratatosk
+  container to the registry, not a call through the Docker daemon.
 - A socket proxy gives little protection here. Ratatosk needs to start, stop and delete containers,
   read logs, stats and files (archive reads), look up registries, and run `docker compose pull` and
   `up -d`. A proxy that lets those container POST calls through generally lets `containers/create`
@@ -383,8 +404,8 @@ only admins see it. There are two roles:
 
 | Role | Can do |
 |------|--------|
-| Admin | Everything an operator can, plus add, remove and change users, reset passwords, find, enter or remove app keys, update and delete containers, set up schedules, and use the Debug panel |
-| Operator | Look at everything except the Debug log, start, stop and restart containers, edit the config files of game servers, and arrange their own page. Cannot manage users or app keys, update or delete containers, set up schedules, or open Debug |
+| Admin | Everything an operator can, plus add, remove and change users, reset passwords, find, enter or remove app keys, update and delete containers, change a pinned image to a newer version and manage ignored version notices, set up schedules, and use the Debug panel |
+| Operator | Look at everything except the Debug log, start, stop and restart containers, edit the config files of game servers, and arrange their own page. Cannot manage users or app keys, update or delete containers, change pinned versions or ignore version notices, set up schedules, or open Debug |
 
 - **Passwords:** an admin sets a password when adding a user and can reset it later. There is no
   email, so a forgotten password is reset by an admin. Everyone can change their own under
@@ -464,7 +485,9 @@ if both are set, the `ratatosk.` one wins.
 ## Updates
 
 Every 30 minutes Ratatosk asks each Compose container's registry whether its
-image tag now points at something newer than what is running. Stopped containers are
+image tag now points at something newer than what is running, and, for an image pinned to a
+version such as `v1.86.0`, whether a newer version tag exists (see
+[Pinned version tags](#pinned-version-tags)). Stopped containers are
 included, so a server you switch off for a while still gets its badge (updating it starts it,
 and the confirmation says so). A container with a newer image gets an **Update** button.
 It asks for confirmation (apps with a database can migrate it on first start, so back up first),
@@ -474,8 +497,9 @@ The answers are kept in memory, so a restart of Ratatosk clears them. It asks ag
 away, once more a minute later if a registry did not answer, and whenever a Compose container
 shows up with an image it has not asked about yet. To refresh them yourself, an admin can use
 **Settings → Updates → Check for updates now**. It checks every Compose container and shows
-how many images it checked, how many have updates, and which ones the registry would not answer
-for (the **Debug** panel has the reason). It works in `READ_ONLY` mode, since it only reads,
+how many images it checked, how many have updates (a pinned container with a newer version that you
+have not ignored counts), and which ones the registry would not answer for (the **Debug** panel has
+the reason). It works in `READ_ONLY` mode, since it only reads,
 and it is not shown when `UPDATE_CHECK=false`. Registries rate-limit anonymous requests, so
 clicking again within a few seconds is refused.
 
@@ -508,6 +532,8 @@ once per Compose project that has containers you want to update:
      - /home/me/media:/home/me/media:ro
    ```
 
+   Leave off `:ro` for a project whose pinned versions you also want Ratatosk to change for you
+   (see [Pinned version tags](#pinned-version-tags)); the Update button itself works either way.
 3. **Recreate Ratatosk** (`docker compose up -d` in its own folder) and reload the page.
 
 Things that trip people up:
@@ -518,14 +544,69 @@ Things that trip people up:
 - **Mount the folder, not just the file.** Compose also reads the `.env` file and any relative paths
   next to the Compose file.
 - **The folder becomes readable by Ratatosk**, including that project's `.env` and anything else in
-  it. Ratatosk can already control every container through the Docker socket, so this adds little,
-  but keep secrets you don't want it to read in a folder that is not mounted.
+  it. Without `:ro` it becomes writable too, though Ratatosk only ever edits one `image:` line (see
+  below). Ratatosk can already control every container through the Docker socket, so this adds
+  little, but keep secrets you don't want it to read in a folder that is not mounted.
+- **Changing a pinned version needs the folder mounted without `:ro`.** The Update button works with
+  a read-only mount, but the choices in the yellow button's dialog that edit the compose file
+  ([Pinned version tags](#pinned-version-tags)) do not. When the mount is read-only the dialog greys
+  them out and says why. Ratatosk changes only that one `image: <ref>` line of that service and
+  leaves the rest of the file exactly as it was, comments included; the file keeps its mode and
+  owner. It refuses when the image comes from a variable such as `${TAG}`, from a YAML anchor or
+  merge key, or when it cannot find a single plain `image:` line in that service. If the pull or the
+  recreate then fails, it puts the file back as it was.
 - **Several Compose files in one project** (a base file plus overrides) must all be reachable at their
   recorded paths. Mounting the folder they sit in covers that if they share one.
 - **On a host with SELinux**, if the file still isn't visible after mounting, see the SELinux note in
   [Troubleshooting](#troubleshooting).
 - **An update badge can outlive the update.** If you updated the container by hand, the badge clears
   after the next registry check (every 30 minutes).
+
+### Pinned version tags
+
+If your compose file pins an image to a version, for example `image: ghcr.io/autobrr/autobrr:v1.86.0`,
+the tag always points at the same image, so the normal check above never finds anything newer. For
+those containers Ratatosk also lists the tags in the image's registry and looks for a later version.
+When there is one, the row gets a **yellow Update button** instead of the usual one.
+
+What counts as a version, and as newer:
+
+- A tag is a version when it is a prefix, a dotted number and a suffix: `v1.86.0`, `1.2`, `16` and
+  `16-alpine` all are.
+- A later tag must have the same prefix, the same suffix and the same number of dotted parts, and be
+  higher. So `v1.86.0` moves to `v1.87.0` or `v2.0.0`, never to `v1.87.0-rc1`, `latest` or `nightly`.
+- Images pinned by digest (`@sha256:`), untagged images and `latest` get no pinned notice. If the
+  normal check finds a newer image for the same tag, the plain **Update** button shows instead.
+
+The yellow button is for admins. Click it and a dialog explains why it is yellow and offers four choices:
+
+1. **Update the compose file to the newer version and update now.** Ratatosk edits the `image:` line to
+   the newer version, then pulls and recreates the container.
+2. **Update the compose file to latest and update now.** The same, but the tag becomes `latest`. This
+   can jump many versions at once. It is not offered if the image already uses `latest`.
+3. **I'll change it myself.** The dialog shows the line to use; nothing is changed.
+4. **Ignore.** The notice is hidden until a version newer than the one you ignored appears.
+
+Choices 1 and 2 need the project folder mounted without `:ro`, at the same path as on the host. If it
+isn't, the dialog greys them out and says why. What Ratatosk changes in the file, and when it
+refuses, is described under [Making the Update button work](#making-the-update-button-work).
+
+Ignored notices are listed under **Settings → Updates → Ignored version notices**, each with an
+**Un-ignore** button (admins). They are kept by container name in `ignored_updates.json` in `/data`.
+
+Things to know:
+
+- **How the tags are found.** Ratatosk asks the registry directly over HTTPS from its own container
+  (not through the Docker daemon), using the anonymous token handshake. Docker Hub, GHCR and Quay
+  work. Private registries and logins are not supported, so those containers get no notice, and
+  **Check for updates now** lists them as not answered. The request does not use HTTP proxy
+  environment variables and does not follow redirects.
+- **When it runs.** In the same 30-minute pass as the normal check and in **Check for updates now**.
+  `UPDATE_CHECK=false` turns it off.
+- **Schedules never change a tag**, see [Schedules](#schedules).
+- **`READ_ONLY=true`** hides the yellow button, as it does the Update button, and refuses choices 1
+  and 2. Ignore and Un-ignore still work, since they only change what is displayed.
+- **Operators** see neither the button nor the Settings list.
 
 ## Schedules
 
@@ -563,7 +644,10 @@ of a shorter month.
   and recreates each container that has a newer image. If an update cannot run (see
   [Making the Update button work](#making-the-update-button-work)) or one is already running, that
   container is skipped and the list says why. This includes **Update/restart**: it does not fall back to
-  a restart then, so a broken update path stays visible.
+  a restart then, so a broken update path stays visible. A schedule never changes an image tag. A
+  container pinned to a version tag (see [Pinned version tags](#pinned-version-tags)) with no newer
+  image behind that tag counts as "no update available", so **Update** leaves it alone and
+  **Update/restart** restarts it, as before. Moving to a newer version is always an admin's click.
 - **Restart** works like the Restart button, including a Pelican game server going through its panel.
 - **Missed runs are not made up.** If Ratatosk was stopped, or the host asleep, more than 5 minutes
   past the time, that run is skipped and noted as missed. The next one happens as normal. Editing a
@@ -694,6 +778,10 @@ Put your files in a folder and mount it into Ratatosk, for example
   `hostname:` or `network_mode: host` is not supported (see [Quick start](#3-adjust-it-optional)).
 - **One Pelican panel per Ratatosk.** Removing one Pelican key removes both (see [Pelican](#pelican)).
 - **Stored keys are not encrypted.** See [Security](#security).
+- **Pinned version notices are simple.** Ratatosk lists tags directly from the registry without a
+  login, so images on a private registry or behind a login get no notice. It only understands
+  plain numeric version tags such as `v1.86.0`, `1.2` or `16-alpine`, see
+  [Pinned version tags](#pinned-version-tags).
 
 ## Development (see also [CONTRIBUTING.md](CONTRIBUTING.md))
 

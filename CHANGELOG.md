@@ -40,6 +40,17 @@ First public version.
 - **Settings → Updates → Check for updates now** (admins) checks every Compose container's registry on
   demand, stopped containers included. The automatic check also covers stopped containers, repeats
   once a minute after a start if a registry did not answer, and runs when a container with a new image appears.
+- Pinned version notice: a Compose container pinned to a version tag (`v1.86.0`, `1.2`, `16-alpine`) gets a
+  yellow **Update** button (admins) when the registry has a newer version of the same style (same prefix,
+  suffix and number of parts; no `-rc`, `latest` or `nightly`). The dialog offers four choices: edit the
+  compose file's `image:` line to the newer version, edit it to `latest`, change it yourself, or ignore.
+  The first two pull and recreate the container, need the project folder mounted without `:ro`, change
+  only that one line and restore the file if the update fails. Tags are listed with an anonymous request
+  to the registry in the same 30-minute pass (off with `UPDATE_CHECK=false`); schedules never change a tag.
+  Adds `pinned.py` to the image.
+- **Settings → Updates → Ignored version notices** (admins) lists the notices you ignored, with **Un-ignore**.
+  An ignored notice stays hidden until a newer version appears. Stored in the new `ignored_updates.json`
+  in `/data`; ignoring and un-ignoring still work in `READ_ONLY`.
 - `/healthz` also asks Docker and answers 503 when the socket is missing or unusable.
 - The example compose file publishes `127.0.0.1:8090` only and sets `no-new-privileges`.
 - qBittorrent: a rejected login is not retried for about five minutes, to stay clear of its IP ban.

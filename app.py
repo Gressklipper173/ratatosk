@@ -1,4 +1,5 @@
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -24,6 +25,7 @@ import activity
 import editor
 import handlers
 import integrations
+import pinned
 import schedules
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
@@ -61,6 +63,7 @@ GROUPS_PATH = os.path.join(DATA_DIR, "groups.json")
 GROUPS_DIR = os.path.join(DATA_DIR, "groups")
 INTEGRATIONS_PATH = os.path.join(DATA_DIR, "integrations.json")
 SCHEDULES_PATH = os.path.join(DATA_DIR, "schedules.json")
+IGNORED_PATH = os.path.join(DATA_DIR, "ignored_updates.json")
 
 # adapters: built-ins ship in ./adapters, an admin's own go in /data/adapters and win by id
 BUILTIN_ADAPTERS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adapters")
@@ -920,6 +923,8 @@ def pick_link(labels, ports):
 # image reference -> manifest digest the registry reports; replaced per answer, so
 # a registry error keeps the last good one
 _registry = {}
+# image reference pinned to a version tag -> the newest later tag of the same style; kept the same way
+_newest = {}
 # container name -> {"state": "running" | "error", "error": str | None}
 _jobs = {}
 _jobs_lock = threading.Lock()
@@ -966,6 +971,11 @@ def is_pending(c):
     return bool(latest and local and latest not in local)
 
 
+def newer_tag(c):
+    """The later version tag the registry lists for a container pinned to a version tag, or None."""
+    return _newest.get(image_ref(c))
+
+
 def check_registry():
     """One pass over every Compose container's image, running or not; errors leave the old
     answer. Returns {"checked", "updates", "errors": [{"image", "error"}]}, or None when another
@@ -996,9 +1006,24 @@ def check_registry():
                 return {"image": ref, "error": f"{type(e).__name__}: {e}"[:200]}
             return None
 
+        def look(ref):
+            registry, repo, tag = pinned.split_ref(ref)
+            try:
+                newer = pinned.fetch_newest(registry, repo, tag)
+            except (OSError, ValueError, http.client.HTTPException) as e:
+                return {"image": ref, "error": f"{type(e).__name__}: {e}"[:200]}
+            if newer:
+                _newest[ref] = newer
+            else:
+                _newest.pop(ref, None)
+            return None
+
+        # a tag that is a plain version never changes, so these also look for a later tag
+        versioned = sorted(r for r in refs if pinned.split_ref(r) and pinned.parse_version(pinned.split_ref(r)[2]))
         with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as pool:
             errors = [r for r in pool.map(ask, sorted(refs)) if r]
-        return {"checked": len(refs), "updates": sum(1 for c in found if is_pending(c)), "errors": errors}
+            errors += [r for r in pool.map(look, versioned) if r]
+        return {"checked": len(refs), "updates": sum(1 for c in found if is_pending(c) or (newer_tag(c) and not is_ignored(c.name, newer_tag(c)))), "errors": errors}
     finally:
         _check_lock.release()
 
@@ -1060,6 +1085,8 @@ def update_info(c, labels):
         return None
     with _jobs_lock:
         job = _jobs.get(c.name)
+    if job and job.get("retag"):
+        return None  # shown by pinned_info
     if job and job["state"] == "running":
         return {"available": True, "state": job["state"], "error": job["error"], "blocked": update_blockers(info[2])}
     pending = is_pending(c)
@@ -1076,31 +1103,106 @@ def update_info(c, labels):
     return {"available": True, "state": None, "error": None, "blocked": update_blockers(info[2])}
 
 
-def _run_update(name, project, service, files, workdir):
+def _compose_steps(project, service, files, workdir):
+    """Pull and recreate one service. Returns the error text, or None when both steps worked."""
     cmd = ["docker", "compose", "-p", project]
     if workdir:
         cmd += ["--project-directory", workdir]
     for f in files:
         cmd += ["-f", f]
-    error = None
     for step in (["pull", service], ["up", "-d", "--no-deps", service]):
         try:
             r = subprocess.run(cmd + step, capture_output=True, text=True, timeout=UPDATE_TIMEOUT)
         except (OSError, subprocess.SubprocessError) as e:
-            error = str(e)
-            break
+            return str(e)
         if r.returncode != 0:
             error = (r.stderr or r.stdout).strip().splitlines()[-1:] or ["compose failed"]
-            error = error[0]
-            break
-    activity.log("error" if error else "info", "updates", f"update of {name} " + (f"failed: {error}" if error else "finished"))
+            return error[0]
+    return None
+
+
+def _finish_job(name, error, retag=False):
     with _jobs_lock:
         if error:
-            _jobs[name] = {"state": "error", "error": error}
+            _jobs[name] = {"state": "error", "error": error, **({"retag": True} if retag else {})}
         else:
-            del _jobs[name]
+            _jobs.pop(name, None)
     if not error:
         check_registry()
+
+
+def _run_update(name, project, service, files, workdir):
+    error = _compose_steps(project, service, files, workdir)
+    activity.log("error" if error else "info", "updates", f"update of {name} " + (f"failed: {error}" if error else "finished"))
+    _finish_job(name, error)
+
+
+# ---- version-pinned images -------------------------------------------------
+#
+# An image pinned to a version tag never has a newer digest, so check_registry also lists the
+# repository's tags (pinned.py). The row then gets a notice with choices instead of a plain Update
+# button; the choice to ignore it is kept in IGNORED_PATH as {container name: the version ignored}.
+
+
+def load_ignored():
+    try:
+        with open(IGNORED_PATH) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def is_ignored(name, newer):
+    seen = load_ignored().get(name)
+    return bool(seen) and (seen == newer or not pinned.is_newer(newer, seen))
+
+
+def pinned_info(c, labels):
+    """What the row shows about a version-pinned image with a later tag, or None."""
+    if not UPDATE_CHECK or is_self(c):
+        return None
+    info = compose_info(labels)
+    if info is None:
+        return None
+    with _jobs_lock:
+        job = _jobs.get(c.name)
+    job = job if job and job.get("retag") else None
+    ref, newer = image_ref(c), newer_tag(c)
+    if not newer or is_pending(c):
+        if job and job["state"] == "error":
+            with _jobs_lock:
+                _jobs.pop(c.name, None)
+        return None
+    if not job and is_ignored(c.name, newer):
+        return None
+    current = pinned.split_ref(ref)[2]
+    reason = update_blockers(info[2]) or pinned.check_rewrite(info[2], info[1], ref)
+    return {
+        "current": current,
+        "newer": newer,
+        "latest": current != "latest",
+        "reason": reason,
+        "state": job["state"] if job else None,
+        "error": job["error"] if job else None,
+    }
+
+
+def _run_retag(name, project, service, files, workdir, old_ref, new_ref):
+    try:
+        path, original = pinned.rewrite_image(files, service, old_ref, new_ref)
+    except pinned.RewriteError as e:
+        activity.log("error", "updates", f"retag of {name} failed: {e}")
+        _finish_job(name, str(e), retag=True)
+        return
+    error = _compose_steps(project, service, files, workdir)
+    if error:
+        problem = pinned.restore(path, original)
+        error = f"{error} (the compose file was put back)" if not problem else f"{error} ({problem})"
+    activity.log("error" if error else "info", "updates", f"retag of {name} to {new_ref} " + (f"failed: {error}" if error else "finished"))
+    _finish_job(name, error, retag=True)
 
 
 def is_game_server(labels):
@@ -1140,6 +1242,7 @@ def describe(c):
         "project": labels.get("com.docker.compose.project"),
         "service": labels.get("com.docker.compose.service"),
         "update": update_info(c, labels),
+        "pinned": pinned_info(c, labels),
         "game": game_info(c, labels),
         "cpu": stats.get("cpu"),
         "mem": stats.get("mem"),
@@ -1161,7 +1264,8 @@ def api_containers():
         return jsonify({"error": str(e), "items": []}), 502
     items.sort(key=lambda i: i["name"])
     user, role = current_user()
-    return jsonify({"error": None, "items": items, "read_only": READ_ONLY, "version": VERSION, "user": user, "role": role, "groups": load_groups(session["user"])})
+    ignored = [{"name": n, "version": v} for n, v in sorted(load_ignored().items())] if role == "admin" and UPDATE_CHECK else []
+    return jsonify({"error": None, "items": items, "read_only": READ_ONLY, "version": VERSION, "user": user, "role": role, "groups": load_groups(session["user"]), "ignored_updates": ignored})
 
 
 @app.route("/api/groups", methods=["PUT"])
@@ -1286,6 +1390,75 @@ def start_update(name):
     activity.log("info", "updates", f"update of {name} started")
     threading.Thread(target=_run_update, args=(name, project, service, files, workdir), daemon=True).start()
     return None, 202
+
+
+@app.route("/api/containers/<name>/tag", methods=["POST"])
+@admin_required
+def container_tag(name):
+    """The choices on a version-pinned image's notice: {"action": "newer" | "latest" | "ignore",
+    "version": the later tag the page showed}. Only an admin's click gets here; schedules never do."""
+    if not csrf_ok():
+        return jsonify({"error": "bad csrf token"}), 403
+    body = request.get_json(silent=True) or {}
+    action, version = body.get("action"), body.get("version")
+    if action not in ("newer", "latest", "ignore"):
+        return jsonify({"error": "unknown action"}), 400
+    # hiding a notice is a display preference, so READ_ONLY allows that one
+    if READ_ONLY and action != "ignore":
+        return jsonify({"error": "Ratatosk is in read-only mode"}), 403
+    if not UPDATE_CHECK:
+        return jsonify({"error": "updates are switched off"}), 400
+    try:
+        c = docker_client.containers.get(name)
+    except docker.errors.NotFound:
+        return jsonify({"error": "no such container"}), 404
+    except docker.errors.DockerException as e:
+        return jsonify({"error": str(e)}), 500
+    labels = c.attrs.get("Config", {}).get("Labels") or {}
+    info = pinned_info(c, labels)
+    if not info:
+        return jsonify({"error": "no newer version to move to"}), 400
+    if info["state"] == "running":
+        return jsonify({"error": "already updating"}), 409
+    if version != info["newer"]:
+        return jsonify({"error": f"the newest version is now {info['newer']}; reopen the notice"}), 409
+    if action == "ignore":
+        with _data_lock:
+            store = load_ignored()
+            store[c.name] = info["newer"]
+            write_json(IGNORED_PATH, store)
+        with _jobs_lock:
+            _jobs.pop(c.name, None)
+        activity.log("info", "updates", f"ignoring {info['newer']} for {c.name}")
+        return jsonify({"error": None})
+    if info["reason"]:
+        return jsonify({"error": info["reason"]}), 400
+    ref = image_ref(c)
+    new_ref = pinned.with_tag(ref, info["newer"] if action == "newer" else "latest")
+    project, service, files, workdir = compose_info(labels)
+    with _jobs_lock:
+        if _jobs.get(c.name, {}).get("state") == "running":
+            return jsonify({"error": "already updating"}), 409
+        _jobs[c.name] = {"state": "running", "error": None, "retag": True}
+    activity.log("info", "updates", f"retag of {c.name} to {new_ref} started")
+    threading.Thread(target=_run_retag, args=(c.name, project, service, files, workdir, ref, new_ref), daemon=True).start()
+    return jsonify({"error": None}), 202
+
+
+@app.route("/api/updates/ignored/<name>/restore", methods=["POST"])
+@admin_required
+def ignored_restore(name):
+    # like dismissing an app notice, this only changes what is displayed, so READ_ONLY allows it
+    if not csrf_ok():
+        return jsonify({"error": "bad csrf token"}), 403
+    with _data_lock:
+        store = load_ignored()
+        if name not in store:
+            return jsonify({"error": "not ignored"}), 404
+        del store[name]
+        write_json(IGNORED_PATH, store)
+    activity.log("info", "updates", f"no longer ignoring the version notice for {name}")
+    return jsonify({"error": None})
 
 
 PELICAN_STALE = 10  # default seconds before the container list asks Pelican again

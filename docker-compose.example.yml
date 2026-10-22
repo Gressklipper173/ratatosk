@@ -38,7 +38,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # Optional, for the Update button. Ratatosk runs `docker compose` from inside its own
       # container, so it must see each project's folder at the SAME path as on the host, on both
-      # sides of the colon (read-only is fine). Without it the Update button stays greyed out
+      # sides of the colon (read-only is fine for the Update button; leave off ":ro" for a project
+      # whose pinned image versions you also want Ratatosk to change for you, since that edits the
+      # compose file; the same-path rule still applies). Without it the Update button stays greyed out
       # with "compose file not visible to Ratatosk". One line per project, for example:
       # - /home/me/media:/home/me/media:ro
       # To find a project's folder:

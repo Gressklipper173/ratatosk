@@ -86,6 +86,10 @@
       <p class="hint">Ratatosk asks each Compose container's registry every 30 minutes whether a newer image exists, stopped containers included. The image names are sent to those registries.</p>
       <button class="mini" id="check-updates" type="button">Check for updates now</button>
       <p class="hint" id="check-updates-status" role="status"></p>
+      <h4 class="cfg-sub">Ignored version notices</h4>
+      <p class="hint">Containers pinned to a version whose newer-version notice you ignored. It comes back when a version newer than the one listed appears, or when you un-ignore it.</p>
+      <div id="ignored-updates"></div>
+      <p class="hint" id="no-ignored-updates">Nothing ignored.</p>
       {% endif %}
       <h3 class="cfg-section">Account</h3>
       <p class="hint">Signed in as {{ user }} ({{ role }}). Your layout and groups belong to this account.</p>

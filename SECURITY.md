@@ -30,7 +30,9 @@ example:
 - getting past the sign-in, the CSRF check or the role limits (operators can't change keys or users),
 - reading a stored app key or password through the page or the API (they are never sent to the browser),
 - reaching a container action, file or Docker feature the signed-in role shouldn't have,
-- a secret appearing in the Debug log.
+- a secret appearing in the Debug log,
+- the pinned-version update writing anything other than the single `image:` line of one service, or
+  writing to a file that is not a compose file you mounted.
 
 Out of scope:
 
@@ -38,6 +40,8 @@ Out of scope:
 - the fact that anyone signed in can start and stop containers, and that stored app keys are kept
   unencrypted in `/data` (mode 0600, which does not hold back root, and Ratatosk runs as root); both
   are documented behaviour,
+- that an admin can make Ratatosk edit the `image:` line of a compose file you mounted without `:ro`
+  (documented behaviour; mount it `:ro` to prevent it),
 - running Ratatosk without `BEHIND_PROXY` behind a proxy, or behind a proxy that passes the
   visitor's own `X-Forwarded-For` or `CF-Connecting-IP` through (see `PROXY_IP_HEADER` in the README),
 - adapters you install in `/data/adapters` yourself: that folder is admin-trust, and an adapter's

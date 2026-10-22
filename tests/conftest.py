@@ -66,6 +66,8 @@ class FakeClient:
     def __init__(self):
         self.by_name = {}
         self.registry = {}
+        self.tags = {}  # repository -> the tags the registry lists for it (a missing one lists none)
+        self.tags_error = None  # set to an exception to make listing tags fail
         self.images = SimpleNamespace(get_registry_data=self._registry_data)
         self.containers = SimpleNamespace(get=self._get, list=self._list)
         self.ping_error = None  # set to an exception to make the daemon look unreachable
@@ -110,6 +112,14 @@ def env(monkeypatch, tmp_path):
         monkeypatch.delenv(name, raising=False)
     client = FakeClient()
     monkeypatch.setattr(docker, "from_env", lambda: client)
+    import pinned
+
+    def list_tags(registry, repo, opener=None):
+        if client.tags_error:
+            raise client.tags_error
+        return client.tags.get(repo, [])
+
+    monkeypatch.setattr(pinned, "list_tags", list_tags)  # no test reaches a real registry
     sys.modules.pop("app", None)
     module = importlib.import_module("app")
     module.app.config["TESTING"] = True
