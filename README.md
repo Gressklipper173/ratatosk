@@ -1,5 +1,22 @@
 # Ratatosk
 
+**A drop-in dashboard for your Docker host.** See, group and control every container from one page,
+with optional panels for the apps running in them.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/desktop-dark.png">
+  <img src="docs/screenshots/desktop-light.png" alt="Ratatosk on a desktop: a host panel with CPU, memory and storage meters, a links panel, and containers sorted into Web, Monitoring, Data, Games and Tools groups" width="100%">
+</picture>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/phone-dark.png">
+    <img src="docs/screenshots/phone-light.png" alt="Ratatosk on a phone, with the host and links panels folded and the container groups below" width="320">
+  </picture>
+</p>
+
+*The screenshots show made-up demo containers.*
+
 A self-hosted dashboard for the containers on one Docker host. It shows every container
 with its state, health, ports, CPU and memory, lets you start, stop and restart them, and groups
 them into panels you arrange yourself. One container, the Docker socket and a data volume are all
