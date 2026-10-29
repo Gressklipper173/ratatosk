@@ -56,8 +56,8 @@ From nothing to a working page, in order.
 ### What you need
 
 - A Linux host running Docker Engine with the Compose plugin. Check with `docker compose version`.
-- `git`, to download the code.
-- Internet access for the first build (it pulls the Python base image and Docker's own CLI image).
+- `git`, to download the example compose file (and the code, if you want to build it yourself).
+- Internet access for the first start: Docker pulls the Ratatosk image from GitHub's container registry (`ghcr.io`).
 - Port 8090 free on the host (or choose another in step 3).
 - A browser on the host itself, or one that can reach it once you open the port up (step 3). Keep
   Ratatosk on a private network, see [Security](#security).
@@ -101,10 +101,12 @@ the hostname Docker gives it, and needs that to avoid offering to stop itself.
 ### 4. Start it
 
 ```
-docker compose up -d --build
+docker compose up -d
 ```
 
-The first build takes a few minutes. When it is done, `docker compose ps` shows `ratatosk` as running.
+Docker pulls the image the first time, which takes a minute. When it is done, `docker compose ps`
+shows `ratatosk` as running. To build from the code instead (for changes of your own), comment out the
+`image:` line in your compose file, uncomment `build: .`, and run `docker compose up -d --build`.
 
 ### 5. Read the one-time setup token
 
@@ -158,9 +160,14 @@ All optional:
 
 ```
 cd ratatosk
-git pull
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
+
+The compose file follows the `0.1` tag, which moves with every 0.1.x release. Use `0.1.0` to stay on
+exactly one release, or `latest` to follow every release, including ones that may change things (0.x
+minor versions can). If you build from the code instead (the `build: .` line), run `git pull` and then
+`docker compose up -d --build`.
 
 Your accounts, layouts and keys live in the `ratatosk-data` volume and are kept. Reload the page
 with a hard refresh (Ctrl+Shift+R) afterwards so the browser doesn't use old scripts. Ratatosk never

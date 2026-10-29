@@ -1,6 +1,9 @@
 services:
   ratatosk:
-    build: .
+    # The published image. 0.1 follows the 0.1.x releases; use 0.1.0 to stay on exactly one release.
+    image: ghcr.io/gressklipper173/ratatosk:0.1
+    # To build from this repository instead, comment out the image line above and use:
+    # build: .
     container_name: ratatosk
     restart: unless-stopped
     # Opens the dashboard on this machine only. To reach it from other devices on your
