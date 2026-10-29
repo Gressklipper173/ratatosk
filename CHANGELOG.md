@@ -2,7 +2,7 @@
 
 All notable changes are listed here. Versions follow [semantic versioning](https://semver.org/).
 
-## 0.1.0 (unreleased)
+## 0.1.0
 
 First public version.
 
